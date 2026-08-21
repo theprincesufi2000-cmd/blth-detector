@@ -248,48 +248,83 @@ class MainActivity : Activity() {
     private fun findAlreadyConnectedDevice() {
 
         if (!hasConnectPermission()) {
-            status.text = "اسمح للتطبيق بالوصول إلى Bluetooth"
+            runOnUiThread {
+                status.text = "اسمح للتطبيق بالوصول إلى Bluetooth"
+            }
             return
         }
 
         if (connecting || gatt != null) return
 
-        val devices = try {
-            bluetoothManager.getConnectedDevices(
-                BluetoothProfile.GATT
-            )
-        } catch (_: SecurityException) {
-            emptyList()
+        /*
+         * Android Settings can show a device as "Connected" through HID or
+         * another Bluetooth profile while it is NOT present in the GATT
+         * connected-device list. The previous implementation incorrectly
+         * treated an empty GATT list as "no connected device".
+         *
+         * Therefore:
+         * 1) Prefer an active GATT connection.
+         * 2) Otherwise use the already PAIRED target directly, with no scan.
+         *
+         * The device from the captures is 9B94-BLE, so we select that exact
+         * bonded device instead of touching unrelated paired devices.
+         */
+
+        val activeGatt = try {
+            bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
         } catch (_: Exception) {
             emptyList()
         }
 
-        /*
-         * Only devices that Android itself currently reports as GATT-connected
-         * are considered. We do NOT show nearby devices and do NOT scan.
-         */
-        if (devices.isEmpty()) {
-            runOnUiThread {
-                status.text = "في انتظار الجهاز المتصل…"
-                deviceName.text = "لا يوجد جهاز GATT متصل حالياً"
-            }
+        val activeTarget = activeGatt.firstOrNull { matchesTarget(it) }
+            ?: activeGatt.firstOrNull()
+
+        if (activeTarget != null) {
+            connectToAlreadyConnectedDevice(activeTarget)
             return
         }
 
-        /*
-         * Prefer a bonded connected device because the user said the target
-         * device is already paired/connected in Android Bluetooth settings.
-         */
-        val selected =
-            devices.firstOrNull { device ->
-                try {
-                    device.bondState == BluetoothDevice.BOND_BONDED
-                } catch (_: SecurityException) {
-                    false
-                }
-            } ?: devices.first()
+        val bonded = try {
+            bluetoothManager.adapter.bondedDevices.toList()
+        } catch (_: Exception) {
+            emptyList()
+        }
 
-        connectToAlreadyConnectedDevice(selected)
+        val target = bonded.firstOrNull { matchesTarget(it) }
+
+        if (target != null) {
+            setDeviceName(target)
+            runOnUiThread {
+                status.text = "تم العثور على الجهاز المقترن — جارٍ الاتصال…"
+                commandLog.text =
+                    "تم التعرف تلقائياً على 9B94-BLE.\n" +
+                    "جارٍ فتح قناة الأزرار…"
+            }
+            connectToAlreadyConnectedDevice(target)
+            return
+        }
+
+        runOnUiThread {
+            status.text = "لم يتم العثور على 9B94-BLE"
+            deviceName.text = "9B94-BLE غير ظاهر ضمن الأجهزة المقترنة"
+            commandLog.text =
+                "لا يوجد بحث عن أجهزة قريبة.\n\n" +
+                "أبقِ 9B94-BLE مقترناً من إعدادات Bluetooth، ثم سيحاول التطبيق الاتصال به تلقائياً."
+        }
+    }
+
+    private fun matchesTarget(device: BluetoothDevice): Boolean {
+        if (!hasConnectPermission()) return false
+
+        val name = try {
+            device.name ?: ""
+        } catch (_: Exception) {
+            ""
+        }
+
+        return name.equals("9B94-BLE", ignoreCase = true) ||
+            name.replace("-", "").replace(" ", "")
+                .equals("9B94BLE", ignoreCase = true)
     }
 
     private fun connectToAlreadyConnectedDevice(
