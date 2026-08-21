@@ -2,7 +2,6 @@ package com.example.bluetoothinspector
 
 import android.Manifest
 import android.app.Activity
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
@@ -10,18 +9,13 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.BluetoothLeScanner
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.graphics.Typeface
 import android.view.Gravity
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -33,30 +27,36 @@ class MainActivity : Activity() {
         getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
     }
 
-    private val adapter: BluetoothAdapter?
-        get() = bluetoothManager.adapter
-
-    private var scanner: BluetoothLeScanner? = null
-    private var scanning = false
     private var gatt: BluetoothGatt? = null
     private var connectedDevice: BluetoothDevice? = null
-
-    private lateinit var root: LinearLayout
-    private lateinit var status: TextView
-    private lateinit var deviceName: TextView
-    private lateinit var receiveButton: Button
-    private lateinit var log: TextView
-    private lateinit var devicesContainer: LinearLayout
-
-    // IMPORTANT:
-    // Nothing is captured until the user presses "استقبال الأوامر".
+    private var commandCharacteristic: BluetoothGattCharacteristic? = null
     private var receiving = false
     private var eventNumber = 0
     private var lastPacket: ByteArray? = null
-    private var idlePacket: ByteArray? = null
+    private var connecting = false
 
     private val handler = Handler(Looper.getMainLooper())
-    private val permissionRequest = 1001
+
+    private lateinit var status: TextView
+    private lateinit var deviceName: TextView
+    private lateinit var commandLog: TextView
+
+    /*
+     * From the device you showed previously:
+     *
+     * Service:        00001000-0000-1000-8000-00805F9B34FB
+     * Notify command: 00001002-0000-1000-8000-00805F9B34FB
+     *
+     * This channel produced the real 7-byte button commands such as:
+     * 54 51 2B 3C 7F 7F 7F
+     *
+     * We therefore search this channel FIRST.
+     */
+    private val commandServiceUuid =
+        UUID.fromString("00001000-0000-1000-8000-00805F9B34FB")
+
+    private val commandCharacteristicUuid =
+        UUID.fromString("00001002-0000-1000-8000-00805F9B34FB")
 
     private val hidServiceUuid =
         UUID.fromString("00001812-0000-1000-8000-00805F9B34FB")
@@ -67,32 +67,17 @@ class MainActivity : Activity() {
     private val cccdUuid =
         UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
 
-    private val shownAddresses = mutableSetOf<String>()
-
-    private val scanCallback = object : ScanCallback() {
-
-        override fun onScanResult(
-            callbackType: Int,
-            result: ScanResult
-        ) {
-            runOnUiThread {
-                addDeviceIfNeeded(result.device)
-            }
-        }
-
-        override fun onBatchScanResults(
-            results: MutableList<ScanResult>
-        ) {
-            runOnUiThread {
-                results.forEach { addDeviceIfNeeded(it.device) }
-            }
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            runOnUiThread {
-                scanning = false
-                status.text = "فشل البحث"
-            }
+    /*
+     * No Bluetooth scan is used.
+     *
+     * Android exposes the devices currently connected to the GATT profile
+     * through BluetoothManager. We poll that list so the app can discover
+     * the device that is ALREADY connected in Android Bluetooth settings.
+     */
+    private val autoDetectRunnable = object : Runnable {
+        override fun run() {
+            findAlreadyConnectedDevice()
+            handler.postDelayed(this, 1000)
         }
     }
 
@@ -104,40 +89,38 @@ class MainActivity : Activity() {
             newState: Int
         ) {
             runOnUiThread {
+
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     connectedDevice = g.device
-                    status.text = "متصل"
-                    deviceName.text = safeName(g.device)
+                    connecting = false
 
-                    receiveButton.isEnabled = false
-                    receiving = false
-                    eventNumber = 0
-                    lastPacket = null
-                    idlePacket = null
-
-                    log.text =
-                        "اضغط «استقبال الأوامر» ثم اضغط أي زر في الجهاز الأصلي."
+                    setDeviceName(g.device)
+                    status.text = "متصل — البحث عن قناة الأزرار…"
 
                     try {
                         g.discoverServices()
                     } catch (_: SecurityException) {
-                        status.text = "صلاحية البلوتوث مرفوضة"
+                        status.text = "صلاحية Bluetooth Connect مطلوبة"
                     }
 
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    receiving = false
-                    receiveButton.isEnabled = false
-                    receiveButton.text = "استقبال الأوامر"
-                    status.text = "غير متصل"
-                    log.text = "تم قطع الاتصال."
-
-                    try {
-                        g.close()
-                    } catch (_: Exception) {
-                    }
-
                     if (gatt === g) {
+                        try {
+                            g.close()
+                        } catch (_: Exception) {
+                        }
+
                         gatt = null
+                        connectedDevice = null
+                        commandCharacteristic = null
+                        receiving = false
+                        connecting = false
+                        lastPacket = null
+
+                        status.text = "في انتظار الجهاز المتصل…"
+                        commandLog.text =
+                            "اتصل بالجهاز من إعدادات Bluetooth.\n" +
+                            "سيتم اكتشافه تلقائياً."
                     }
                 }
             }
@@ -147,45 +130,61 @@ class MainActivity : Activity() {
             g: BluetoothGatt,
             statusCode: Int
         ) {
-            runOnUiThread {
-                if (statusCode != BluetoothGatt.GATT_SUCCESS) {
-                    status.text = "فشل الاتصال بخدمات الجهاز"
-                    log.text = "لم يتمكن Android من قراءة خدمات الجهاز."
-                    return@runOnUiThread
+            if (statusCode != BluetoothGatt.GATT_SUCCESS) {
+                runOnUiThread {
+                    status.text = "تعذر قراءة خدمات الجهاز"
+                    commandLog.text =
+                        "تم الاتصال، لكن Android لم يكمل اكتشاف خدمات GATT."
                 }
-
-                val input = findHidInputReport(g)
-
-                if (input == null) {
-                    status.text = "متصل — لا توجد قناة HID للأزرار"
-                    log.text =
-                        "لم يتم العثور على HID Input Report (2A4D)."
-                    receiveButton.isEnabled = false
-                } else {
-                    status.text = "متصل — جاهز"
-                    log.text =
-                        "الجهاز متصل.\n\nاضغط «استقبال الأوامر» للبدء."
-                    receiveButton.isEnabled = true
-                }
+                return
             }
+
+            /*
+             * IMPORTANT:
+             * We do not display the services to the user.
+             * They are searched internally only to find the command channel.
+             */
+            val target = findBestCommandCharacteristic(g)
+
+            if (target == null) {
+                runOnUiThread {
+                    status.text = "متصل — لم يتم العثور على قناة أزرار"
+                    commandLog.text =
+                        "تم الاتصال بالجهاز، لكن لم نجد قناة إشعارات " +
+                        "للأوامر.\n\n" +
+                        "لن نعرض خدمات أو UUIDs أو بيانات غير مرتبطة."
+                }
+                return
+            }
+
+            commandCharacteristic = target
+
+            runOnUiThread {
+                status.text = "متصل — قناة الأزرار جاهزة"
+                commandLog.text =
+                    "جاهز لاستقبال أوامر الأزرار.\n\n" +
+                    "اضغط أي زر في الجهاز الأصلي."
+            }
+
+            enableNotifications(g, target)
         }
 
-        // Android 13+ callback.
+        // Android 13+
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
-            handleInputReport(characteristic, value)
+            handleCommandPacket(characteristic, value)
         }
 
-        // Older Android callback.
+        // Older Android
         @Deprecated("Deprecated in Android 13")
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
-            handleInputReport(
+            handleCommandPacket(
                 characteristic,
                 characteristic.value ?: ByteArray(0)
             )
@@ -201,36 +200,40 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (statusCode == BluetoothGatt.GATT_SUCCESS) {
                     receiving = true
-                    status.text = "استقبال الأوامر: ON"
-                    log.text =
-                        "جاهز.\n\nاضغط أي زر في الجهاز الأصلي الآن.\n" +
-                        "ستظهر البيانات الأصلية فقط."
+                    status.text = "متصل — جاهز لاستقبال الأوامر"
+                    commandLog.text =
+                        "اضغط أي زر في الجهاز الأصلي الآن."
                 } else {
                     receiving = false
-                    status.text = "تعذر تشغيل استقبال الأوامر"
-                    log.text =
-                        "لم يتمكن الجهاز من تفعيل استقبال HID."
+                    status.text = "تعذر تشغيل قناة الأزرار"
+                    commandLog.text =
+                        "تم العثور على قناة الأزرار، لكن Android " +
+                        "لم يستطع تفعيل الإشعارات."
                 }
-
-                receiveButton.text =
-                    if (receiving) {
-                        "إيقاف استقبال الأوامر"
-                    } else {
-                        "استقبال الأوامر"
-                    }
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        buildUi()
-        requestBluetoothPermissions()
-        showPairedDevices()
+
+        buildCleanUi()
+
+        requestConnectPermission()
+
+        /*
+         * Start immediately. No Search button.
+         */
+        handler.post(autoDetectRunnable)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        findAlreadyConnectedDevice()
     }
 
     override fun onDestroy() {
-        stopScan()
+        handler.removeCallbacks(autoDetectRunnable)
 
         try {
             gatt?.disconnect()
@@ -242,239 +245,75 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun buildUi() {
+    private fun findAlreadyConnectedDevice() {
 
-        root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xFF090D12.toInt())
-            setPadding(dp(18), dp(18), dp(18), dp(18))
-        }
-
-        val title = text(
-            "Bluetooth Command Capture",
-            25f,
-            true
-        )
-        root.addView(title, lp(-1, -2))
-
-        status = text(
-            "اختر الجهاز المقترن",
-            15f,
-            false
-        ).apply {
-            setTextColor(0xFF6EE78A.toInt())
-            setPadding(
-                dp(14),
-                dp(14),
-                dp(14),
-                dp(14)
-            )
-            setBackgroundColor(0xFF121A24.toInt())
-        }
-
-        root.addView(
-            status,
-            marginLp(-1, -2, 0, 10, 0, 10)
-        )
-
-        deviceName = text(
-            "لا يوجد جهاز متصل",
-            20f,
-            true
-        )
-
-        root.addView(
-            deviceName,
-            marginLp(-1, -2, 0, 8, 0, 8)
-        )
-
-        val scan = Button(this).apply {
-            text = "البحث عن الجهاز"
-            setOnClickListener {
-                startScan()
-            }
-        }
-
-        root.addView(
-            scan,
-            marginLp(-1, -2, 0, 6, 0, 6)
-        )
-
-        receiveButton = Button(this).apply {
-            text = "استقبال الأوامر"
-            isEnabled = false
-
-            setOnClickListener {
-                if (receiving) {
-                    stopReceiving()
-                } else {
-                    startReceiving()
-                }
-            }
-        }
-
-        root.addView(
-            receiveButton,
-            marginLp(-1, -2, 0, 6, 0, 12)
-        )
-
-        val deviceTitle = text(
-            "الأجهزة المقترنة",
-            17f,
-            true
-        )
-
-        root.addView(
-            deviceTitle,
-            lp(-1, -2)
-        )
-
-        devicesContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-
-        val deviceScroll = ScrollView(this).apply {
-            addView(devicesContainer)
-        }
-
-        root.addView(
-            deviceScroll,
-            LinearLayout.LayoutParams(-1, dp(150))
-        )
-
-        val commandTitle = text(
-            "الأمر المستلم",
-            17f,
-            true
-        )
-
-        root.addView(
-            commandTitle,
-            marginLp(-1, -2, 0, 12, 0, 6)
-        )
-
-        log = text(
-            "بعد الاتصال اضغط «استقبال الأوامر» ثم اضغط زرًا في الجهاز.",
-            16f,
-            false
-        ).apply {
-            typeface = android.graphics.Typeface.MONOSPACE
-            setTextColor(0xFFE8EDF3.toInt())
-            setPadding(
-                dp(14),
-                dp(14),
-                dp(14),
-                dp(14)
-            )
-            setBackgroundColor(0xFF111820.toInt())
-        }
-
-        val logScroll = ScrollView(this).apply {
-            addView(log)
-        }
-
-        root.addView(
-            logScroll,
-            LinearLayout.LayoutParams(
-                -1,
-                0,
-                1f
-            )
-        )
-
-        setContentView(root)
-    }
-
-    private fun showPairedDevices() {
-
-        devicesContainer.removeAllViews()
-        shownAddresses.clear()
-
-        val a = adapter
-
-        if (a == null) {
-            status.text = "البلوتوث غير متوفر"
+        if (!hasConnectPermission()) {
+            status.text = "اسمح للتطبيق بالوصول إلى Bluetooth"
             return
         }
 
+        if (connecting || gatt != null) return
+
         val devices = try {
-            a.bondedDevices.toList()
+            bluetoothManager.getConnectedDevices(
+                BluetoothProfile.GATT
+            )
         } catch (_: SecurityException) {
+            emptyList()
+        } catch (_: Exception) {
             emptyList()
         }
 
+        /*
+         * Only devices that Android itself currently reports as GATT-connected
+         * are considered. We do NOT show nearby devices and do NOT scan.
+         */
         if (devices.isEmpty()) {
-            devicesContainer.addView(
-                text(
-                    "لا يوجد جهاز مقترن. اقترن بالجهاز من إعدادات Bluetooth أولاً.",
-                    14f,
+            runOnUiThread {
+                status.text = "في انتظار الجهاز المتصل…"
+                deviceName.text = "لا يوجد جهاز GATT متصل حالياً"
+            }
+            return
+        }
+
+        /*
+         * Prefer a bonded connected device because the user said the target
+         * device is already paired/connected in Android Bluetooth settings.
+         */
+        val selected =
+            devices.firstOrNull { device ->
+                try {
+                    device.bondState == BluetoothDevice.BOND_BONDED
+                } catch (_: SecurityException) {
                     false
-                )
-            )
-            return
-        }
+                }
+            } ?: devices.first()
 
-        devices
-            .sortedBy { safeName(it) }
-            .forEach {
-                addDeviceIfNeeded(it)
-            }
+        connectToAlreadyConnectedDevice(selected)
     }
 
-    private fun addDeviceIfNeeded(
-        device: BluetoothDevice
-    ) {
-        val address = try {
-            device.address
-        } catch (_: SecurityException) {
-            return
-        }
-
-        if (!shownAddresses.add(address)) return
-
-        val button = Button(this).apply {
-            text = safeName(device)
-            gravity = Gravity.CENTER_VERTICAL
-
-            setOnClickListener {
-                connectToDevice(device)
-            }
-        }
-
-        devicesContainer.addView(
-            button,
-            marginLp(-1, -2, 0, 4, 0, 4)
-        )
-    }
-
-    private fun connectToDevice(
+    private fun connectToAlreadyConnectedDevice(
         device: BluetoothDevice
     ) {
 
-        stopScan()
+        if (!hasConnectPermission()) return
+        if (connecting || gatt != null) return
 
-        if (!hasConnectPermission()) {
-            requestBluetoothPermissions()
-            return
+        connecting = true
+
+        setDeviceName(device)
+
+        runOnUiThread {
+            status.text = "الجهاز متصل — جارٍ فتح قناة الأزرار…"
+            commandLog.text =
+                "تم اكتشاف الجهاز المتصل تلقائياً."
         }
 
         try {
-            gatt?.disconnect()
-            gatt?.close()
-            gatt = null
-
-            receiving = false
-            eventNumber = 0
-            lastPacket = null
-            idlePacket = null
-
-            receiveButton.isEnabled = false
-            receiveButton.text = "استقبال الأوامر"
-
-            status.text = "جارٍ الاتصال…"
-            deviceName.text = safeName(device)
-            log.text = "جارٍ الاتصال بالجهاز…"
-
+            /*
+             * We connect as a GATT client only to read the already-connected
+             * peripheral's services and subscribe to its command notifications.
+             */
             gatt =
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     device.connectGatt(
@@ -493,192 +332,232 @@ class MainActivity : Activity() {
                 }
 
         } catch (_: Exception) {
-            status.text = "فشل الاتصال"
-            log.text = "تعذر الاتصال بالجهاز."
+            connecting = false
+            gatt = null
+
+            runOnUiThread {
+                status.text = "تعذر فتح اتصال الجهاز"
+                commandLog.text =
+                    "الجهاز ظاهر كمتصل في Android، لكن لم يسمح النظام " +
+                    "بفتح جلسة GATT إضافية."
+            }
         }
     }
 
-    private fun startReceiving() {
+    private fun findBestCommandCharacteristic(
+        g: BluetoothGatt
+    ): BluetoothGattCharacteristic? {
 
-        if (!hasConnectPermission()) {
-            requestBluetoothPermissions()
-            return
+        /*
+         * Priority 1:
+         * The exact custom command channel observed on this device.
+         */
+        val customService =
+            g.getService(commandServiceUuid)
+
+        val exact =
+            customService?.getCharacteristic(
+                commandCharacteristicUuid
+            )
+
+        if (exact != null &&
+            isNotificationCharacteristic(exact)
+        ) {
+            return exact
         }
 
-        val g = gatt ?: return
-        val input = findHidInputReport(g)
+        /*
+         * Priority 2:
+         * Standard HID Input Report.
+         */
+        val hidService =
+            g.getService(hidServiceUuid)
 
-        if (input == null) {
-            status.text = "لا توجد قناة أزرار HID"
-            return
+        val hidInput =
+            hidService?.getCharacteristic(
+                hidInputReportUuid
+            )
+
+        if (hidInput != null &&
+            isNotificationCharacteristic(hidInput)
+        ) {
+            return hidInput
         }
+
+        /*
+         * Priority 3:
+         * If the manufacturer changed the custom UUID, look for a
+         * notification characteristic. This is internal only; nothing is
+         * displayed to the user.
+         */
+        val all =
+            g.services.flatMap {
+                it.characteristics
+            }
+
+        return all.firstOrNull {
+            isNotificationCharacteristic(it)
+        }
+    }
+
+    private fun isNotificationCharacteristic(
+        characteristic: BluetoothGattCharacteristic
+    ): Boolean {
+
+        val properties = characteristic.properties
+
+        return (
+            properties and
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY
+        ) != 0 ||
+            (
+                properties and
+                    BluetoothGattCharacteristic.PROPERTY_INDICATE
+            ) != 0
+    }
+
+    private fun enableNotifications(
+        g: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
+    ) {
+
+        if (!hasConnectPermission()) return
 
         try {
-            // This is the ONLY notification we enable.
-            // No custom notification channels are subscribed.
-            val local =
+
+            val localResult =
                 g.setCharacteristicNotification(
-                    input,
+                    characteristic,
                     true
                 )
 
-            if (!local) {
-                status.text = "تعذر تفعيل استقبال الأوامر"
+            if (!localResult) {
+                runOnUiThread {
+                    status.text = "تعذر تجهيز قناة الأزرار"
+                }
                 return
             }
 
             val descriptor =
-                input.getDescriptor(cccdUuid)
+                characteristic.getDescriptor(cccdUuid)
 
             if (descriptor == null) {
-                status.text = "قناة HID لا تحتوي CCCD"
+                runOnUiThread {
+                    status.text = "قناة الأزرار بلا إعداد إشعارات"
+                }
                 return
             }
 
+            val isIndication =
+                (
+                    characteristic.properties and
+                        BluetoothGattCharacteristic
+                            .PROPERTY_INDICATE
+                ) != 0 &&
+                    (
+                        characteristic.properties and
+                            BluetoothGattCharacteristic
+                                .PROPERTY_NOTIFY
+                    ) == 0
+
             descriptor.value =
-                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                if (isIndication) {
+                    BluetoothGattDescriptor
+                        .ENABLE_INDICATION_VALUE
+                } else {
+                    BluetoothGattDescriptor
+                        .ENABLE_NOTIFICATION_VALUE
+                }
 
             val started =
                 g.writeDescriptor(descriptor)
 
             if (!started) {
-                status.text = "تعذر بدء استقبال الأوامر"
+                runOnUiThread {
+                    status.text = "تعذر بدء استقبال الأوامر"
+                }
             }
 
         } catch (_: Exception) {
-            status.text = "تعذر بدء استقبال الأوامر"
-        }
-    }
-
-    private fun stopReceiving() {
-
-        if (!hasConnectPermission()) {
-            requestBluetoothPermissions()
-            return
-        }
-
-        val g = gatt
-        val input =
-            g?.let {
-                findHidInputReport(it)
-            }
-
-        if (g != null && input != null) {
-            try {
-                g.setCharacteristicNotification(
-                    input,
-                    false
-                )
-
-                input.getDescriptor(cccdUuid)?.let {
-                    it.value =
-                        BluetoothGattDescriptor
-                            .DISABLE_NOTIFICATION_VALUE
-
-                    g.writeDescriptor(it)
-                }
-
-            } catch (_: Exception) {
+            runOnUiThread {
+                status.text = "تعذر تفعيل قناة الأزرار"
             }
         }
-
-        receiving = false
-        receiveButton.text = "استقبال الأوامر"
-        status.text = "الاستقبال متوقف"
-        log.text =
-            "اضغط «استقبال الأوامر» عندما تريد التقاط زر جديد."
     }
 
-    private fun findHidInputReport(
-        g: BluetoothGatt
-    ): BluetoothGattCharacteristic? {
-
-        val hidService =
-            g.getService(hidServiceUuid)
-                ?: g.services.firstOrNull {
-                    it.uuid == hidServiceUuid
-                }
-
-        return hidService
-            ?.getCharacteristic(hidInputReportUuid)
-            ?: g.services
-                .flatMap {
-                    it.characteristics
-                }
-                .firstOrNull {
-                    it.uuid == hidInputReportUuid
-                }
-    }
-
-    private fun handleInputReport(
+    private fun handleCommandPacket(
         characteristic: BluetoothGattCharacteristic,
         value: ByteArray
     ) {
 
-        // Nothing is recorded before the button is pressed.
         if (!receiving) return
+        if (value.isEmpty()) return
 
-        // Absolute filter: only HID Input Report.
-        if (characteristic.uuid != hidInputReportUuid) {
+        val expected =
+            commandCharacteristic
+
+        if (expected != null &&
+            characteristic.uuid != expected.uuid
+        ) {
             return
         }
 
-        if (value.isEmpty()) return
+        /*
+         * Ignore all-zero HID release/idle packets.
+         * For the custom 1002 command channel, a packet is captured whenever
+         * its bytes actually change.
+         */
+        val previous = lastPacket
+
+        if (previous != null &&
+            previous.contentEquals(value)
+        ) {
+            return
+        }
+
+        val isAllZero =
+            value.all { byte ->
+                (byte.toInt() and 0xFF) == 0
+            }
+
+        if (isAllZero) {
+            lastPacket = value.clone()
+            return
+        }
+
+        eventNumber++
+
+        val hex =
+            value.joinToString(" ") { byte ->
+                "%02X".format(
+                    byte.toInt() and 0xFF
+                )
+            }
+
+        val changed =
+            if (previous == null) {
+                "أول أمر"
+            } else {
+                value.indices
+                    .filter { index ->
+                        index >= previous.size ||
+                            value[index] != previous[index]
+                    }
+                    .joinToString(", ") { index ->
+                        (index + 1).toString()
+                    }
+                    .ifEmpty {
+                        "لا يوجد"
+                    }
+            }
+
+        lastPacket = value.clone()
 
         runOnUiThread {
-
-            // HID devices often send the same idle report continuously.
-            // Do not show those repeats as button commands.
-            if (lastPacket != null && lastPacket!!.contentEquals(value)) {
-                return@runOnUiThread
-            }
-
-            if (idlePacket == null) {
-                idlePacket = value.clone()
-                lastPacket = value.clone()
-                return@runOnUiThread
-            }
-
-            // Returning to the idle report is a release, not a new button command.
-            if (idlePacket!!.contentEquals(value)) {
-                lastPacket = value.clone()
-                return@runOnUiThread
-            }
-
-            eventNumber++
-
-            val hex =
-                value.joinToString(" ") {
-                    "%02X".format(
-                        it.toInt() and 0xFF
-                    )
-                }
-
-            val previous = lastPacket
-
-            val changed =
-                if (previous == null) {
-                    "أول تقرير"
-                } else {
-                    value.indices
-                        .filter { index ->
-                            index >= previous.size ||
-                                value[index] != previous[index]
-                        }
-                        .joinToString(", ") {
-                            (it + 1).toString()
-                        }
-                        .ifEmpty {
-                            "لا يوجد تغيير"
-                        }
-                }
-
-            lastPacket = value.clone()
-
             status.text =
-                "تم استقبال الأمر #$eventNumber"
+                "تم التقاط الأمر #$eventNumber"
 
-            log.text =
+            commandLog.text =
                 """
                 الأمر #$eventNumber
 
@@ -688,190 +567,247 @@ class MainActivity : Activity() {
                 البايتات المتغيرة:
                 $changed
 
-                اضغط زرًا آخر لتسجيله.
+                اضغط الزر التالي في الجهاز الأصلي.
                 """.trimIndent()
         }
     }
 
-    private fun startScan() {
+    private fun setDeviceName(
+        device: BluetoothDevice
+    ) {
 
-        if (!hasScanPermission()) {
-            requestBluetoothPermissions()
-            return
-        }
-
-        val a = adapter ?: return
-
-        val enabled =
+        val name =
             try {
-                a.isEnabled
+                device.name
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "Bluetooth Device"
             } catch (_: SecurityException) {
-                false
+                "Bluetooth Device"
             }
 
-        if (!enabled) {
-            try {
-                startActivity(
-                    Intent(
-                        BluetoothAdapter.ACTION_REQUEST_ENABLE
-                    )
+        runOnUiThread {
+            deviceName.text = name
+        }
+    }
+
+    private fun buildCleanUi() {
+
+        val root =
+            LinearLayout(this).apply {
+                orientation =
+                    LinearLayout.VERTICAL
+
+                setBackgroundColor(
+                    0xFF090D12.toInt()
                 )
-            } catch (_: Exception) {
+
+                setPadding(
+                    dp(18),
+                    dp(18),
+                    dp(18),
+                    dp(18)
+                )
             }
+
+        val title =
+            makeText(
+                "Bluetooth Command Capture",
+                25f,
+                true
+            )
+
+        root.addView(
+            title,
+            params(-1, -2)
+        )
+
+        status =
+            makeText(
+                "في انتظار الجهاز المتصل…",
+                16f,
+                true
+            ).apply {
+                setTextColor(
+                    0xFF6EE78A.toInt()
+                )
+
+                gravity = Gravity.CENTER_VERTICAL
+
+                setPadding(
+                    dp(14),
+                    dp(16),
+                    dp(14),
+                    dp(16)
+                )
+
+                setBackgroundColor(
+                    0xFF121A24.toInt()
+                )
+            }
+
+        root.addView(
+            status,
+            marginParams(
+                -1,
+                -2,
+                0,
+                14,
+                0,
+                12
+            )
+        )
+
+        deviceName =
+            makeText(
+                "لا يوجد جهاز متصل",
+                23f,
+                true
+            ).apply {
+                gravity = Gravity.CENTER
+            }
+
+        root.addView(
+            deviceName,
+            marginParams(
+                -1,
+                -2,
+                0,
+                0,
+                0,
+                16
+            )
+        )
+
+        val readyTitle =
+            makeText(
+                "التقاط أوامر الأزرار",
+                18f,
+                true
+            )
+
+        root.addView(
+            readyTitle,
+            marginParams(
+                -1,
+                -2,
+                0,
+                4,
+                0,
+                8
+            )
+        )
+
+        commandLog =
+            makeText(
+                "اتصل بالجهاز من إعدادات Bluetooth.\n" +
+                    "سيتم اكتشافه تلقائياً.",
+                17f,
+                false
+            ).apply {
+
+                typeface =
+                    Typeface.MONOSPACE
+
+                setTextColor(
+                    0xFFE8EDF3.toInt()
+                )
+
+                setPadding(
+                    dp(16),
+                    dp(18),
+                    dp(16),
+                    dp(18)
+                )
+
+                setBackgroundColor(
+                    0xFF111820.toInt()
+                )
+            }
+
+        val scroll =
+            ScrollView(this).apply {
+                addView(commandLog)
+            }
+
+        root.addView(
+            scroll,
+            LinearLayout.LayoutParams(
+                -1,
+                0,
+                1f
+            )
+        )
+
+        setContentView(root)
+    }
+
+    private fun requestConnectPermission() {
+
+        if (Build.VERSION.SDK_INT <
+            Build.VERSION_CODES.S
+        ) {
             return
         }
 
-        if (scanning) return
-
-        shownAddresses.clear()
-        devicesContainer.removeAllViews()
-        status.text = "جارٍ البحث…"
-
-        scanner =
-            try {
-                a.bluetoothLeScanner
-            } catch (_: SecurityException) {
-                null
-            }
-
-        if (scanner == null) {
-            status.text = "ماسح BLE غير متوفر"
-            return
-        }
-
-        scanning = true
-
-        try {
-            scanner?.startScan(
-                null,
-                ScanSettings.Builder()
-                    .setScanMode(
-                        ScanSettings.SCAN_MODE_LOW_LATENCY
-                    )
-                    .build(),
-                scanCallback
-            )
-
-            handler.postDelayed(
-                {
-                    stopScan()
-                },
-                12000
-            )
-
-        } catch (_: Exception) {
-            scanning = false
-            status.text = "فشل البحث"
-        }
-    }
-
-    private fun stopScan() {
-
-        handler.removeCallbacksAndMessages(null)
-
-        if (!scanning) return
-
-        try {
-            scanner?.stopScan(scanCallback)
-        } catch (_: Exception) {
-        }
-
-        scanning = false
-
-        status.text =
-            if (connectedDevice != null) {
-                "متصل"
-            } else {
-                "البحث متوقف"
-            }
-    }
-
-    private fun requestBluetoothPermissions() {
-
-        val permissions =
-            mutableListOf<String>()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            permissions +=
-                Manifest.permission.BLUETOOTH_SCAN
-
-            permissions +=
+        if (
+            checkSelfPermission(
                 Manifest.permission.BLUETOOTH_CONNECT
-        } else {
-            permissions +=
-                Manifest.permission.ACCESS_FINE_LOCATION
-        }
-
-        val needed =
-            permissions.filter {
-                checkSelfPermission(it) !=
-                    PackageManager.PERMISSION_GRANTED
-            }
-
-        if (needed.isNotEmpty()) {
+            ) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
             requestPermissions(
-                needed.toTypedArray(),
-                permissionRequest
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_CONNECT
+                ),
+                2001
             )
         }
     }
 
     private fun hasConnectPermission(): Boolean {
+
         return Build.VERSION.SDK_INT <
             Build.VERSION_CODES.S ||
             checkSelfPermission(
                 Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
+            ) ==
+            PackageManager.PERMISSION_GRANTED
     }
 
-    private fun hasScanPermission(): Boolean {
-        return Build.VERSION.SDK_INT <
-            Build.VERSION_CODES.S ||
-            checkSelfPermission(
-                Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
-    }
-
-    private fun safeName(
-        device: BluetoothDevice
-    ): String {
-        return try {
-            device.name
-                ?.takeIf { it.isNotBlank() }
-                ?: "جهاز Bluetooth"
-        } catch (_: SecurityException) {
-            "جهاز Bluetooth"
-        }
-    }
-
-    private fun text(
+    private fun makeText(
         value: String,
         size: Float,
         bold: Boolean
     ): TextView {
+
         return TextView(this).apply {
+
             text = value
             textSize = size
-            setTextColor(0xFFE8EDF3.toInt())
+
+            setTextColor(
+                0xFFE8EDF3.toInt()
+            )
 
             if (bold) {
                 typeface =
-                    android.graphics.Typeface.DEFAULT_BOLD
+                    Typeface.DEFAULT_BOLD
             }
         }
     }
 
-    private fun lp(
+    private fun params(
         width: Int,
         height: Int
     ): LinearLayout.LayoutParams {
+
         return LinearLayout.LayoutParams(
             width,
             height
         )
     }
 
-    private fun marginLp(
+    private fun marginParams(
         width: Int,
         height: Int,
         left: Int,
@@ -879,6 +815,7 @@ class MainActivity : Activity() {
         right: Int,
         bottom: Int
     ): LinearLayout.LayoutParams {
+
         return LinearLayout.LayoutParams(
             width,
             height
@@ -893,6 +830,7 @@ class MainActivity : Activity() {
     }
 
     private fun dp(value: Int): Int {
+
         return (
             value *
                 resources.displayMetrics.density
