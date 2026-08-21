@@ -57,6 +57,28 @@ class MainActivity : Activity() {
     private var scanning = false
     private var gatt: BluetoothGatt? = null
 
+    // Command capture: only traffic that can represent a device command/report.
+    private var commandCaptureEnabled = true
+    private var commandCount = 0
+    private var lastReportByUuid = mutableMapOf<UUID, ByteArray>()
+    private val commandCharacteristics = mutableSetOf<UUID>()
+    private val commandLog = mutableListOf<String>()
+
+    private val pendingCommandNotifications =
+        mutableListOf<Pair<BluetoothGattCharacteristic, Boolean>>()
+    private var commandNotificationWriteInProgress = false
+
+    private val HID_SERVICE_UUID =
+        UUID.fromString("00001812-0000-1000-8000-00805F9B34FB")
+    private val HID_INPUT_REPORT_UUID =
+        UUID.fromString("00002A4D-0000-1000-8000-00805F9B34FB")
+    private val HID_REPORT_MAP_UUID =
+        UUID.fromString("00002A4B-0000-1000-8000-00805F9B34FB")
+    private val BATTERY_LEVEL_UUID =
+        UUID.fromString("00002A19-0000-1000-8000-00805F9B34FB")
+    private val GENERIC_ATTRIBUTE_CHANGED_UUID =
+        UUID.fromString("00002A05-0000-1000-8000-00805F9B34FB")
+
     private val seen = linkedMapOf<String, ScanResult>()
     private val handler = Handler(Looper.getMainLooper())
 
@@ -223,7 +245,7 @@ class MainActivity : Activity() {
         val subtitle = TextView(this).apply {
 
             text =
-                "Classic Bluetooth + BLE • SDP • GATT • RSSI • Manufacturer Data"
+                "Command Capture • HID Reports • Custom Bluetooth Commands"
 
             textSize = 13f
 
@@ -321,6 +343,9 @@ class MainActivity : Activity() {
         pairedButton.setOnClickListener {
             renderPaired()
         }
+
+        // The inspector is intentionally command-focused after a GATT connection.
+        // No GATT database is shown until the user asks for it from the connection.
 
         val scroll =
             ScrollView(this)
@@ -1296,6 +1321,9 @@ class MainActivity : Activity() {
 
                         BluetoothProfile.STATE_DISCONNECTED -> {
 
+                            commandCharacteristics.clear()
+                            lastReportByUuid.clear()
+
                             status.text =
                                 "GATT DISCONNECTED • ${safeName(g.device)}"
 
@@ -1489,6 +1517,14 @@ class MainActivity : Activity() {
                 statusCode: Int
             ) {
 
+                if (d.uuid == CCCD_UUID && commandNotificationWriteInProgress) {
+                    commandNotificationWriteInProgress = false
+                    runOnUiThread {
+                        enableNextCommandNotification(g)
+                    }
+                    return
+                }
+
                 runOnUiThread {
 
                     addSection(
@@ -1518,24 +1554,146 @@ class MainActivity : Activity() {
                 emptyList<BluetoothGattService>()
             }
 
+        // Do not dump the whole GATT database. Build a focused command-capture screen.
+        results.removeAllViews()
+        commandCount = 0
+        lastReportByUuid.clear()
+        commandCharacteristics.clear()
+        commandLog.clear()
+
         addSection(
-            "GATT DATABASE",
+            "COMMAND CAPTURE",
             """
             Device: ${safeName(g.device)}
             Address: ${safeAddress(g.device)}
-            Connection: CONNECTED
-            Discovery status: $statusCode
-            Services: ${services.size}
+            Status: ${if (statusCode == BluetoothGatt.GATT_SUCCESS) "READY" else "DISCOVERY ERROR $statusCode"}
+
+            Press a physical button on the original Bluetooth device.
+            The exact bytes received from the device will appear below.
+
+            Capture: ${if (commandCaptureEnabled) "ON" else "PAUSED"}
             """.trimIndent()
         )
 
-        services.forEach { service ->
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
 
-            renderGattService(
-                g,
-                service
+        val clear = button("Clear")
+        val pause = button(if (commandCaptureEnabled) "Pause" else "Resume")
+        val info = button("What is this?")
+
+        clear.setOnClickListener {
+            commandCount = 0
+            lastReportByUuid.clear()
+            commandLog.clear()
+            results.removeAllViews()
+            addSection(
+                "COMMAND CAPTURE",
+                """
+                Device: ${safeName(g.device)}
+                Address: ${safeAddress(g.device)}
+                Capture: ${if (commandCaptureEnabled) "ON" else "PAUSED"}
+
+                Press a physical button on the original device.
+                """.trimIndent()
             )
         }
+
+        pause.setOnClickListener {
+            commandCaptureEnabled = !commandCaptureEnabled
+            pause.text = if (commandCaptureEnabled) "Pause" else "Resume"
+            status.text = if (commandCaptureEnabled) {
+                "Command capture resumed"
+            } else {
+                "Command capture paused"
+            }
+        }
+
+        info.setOnClickListener {
+            AlertDialog.Builder(this)
+                .setTitle("Command Capture")
+                .setMessage(
+                    "This screen listens only to notification/indication traffic that can carry device commands or HID input reports.\n\n" +
+                        "The HEX value is the exact payload received from the Bluetooth device. " +
+                        "It is not modified or converted before display.\n\n" +
+                        "For programming the replacement app, record the UUID + HEX for each physical button."
+                )
+                .setPositiveButton("OK", null)
+                .show()
+        }
+
+        controls.addView(clear, weightLp())
+        controls.addView(pause, weightLp())
+        controls.addView(info, weightLp())
+
+        results.addView(controls, lp(-1, -2))
+
+        val candidates = mutableListOf<BluetoothGattCharacteristic>()
+
+        services.forEach { service ->
+            val serviceUuid = service.uuid
+            val isHid = serviceUuid == HID_SERVICE_UUID
+            val isCustom = isCustomService(serviceUuid)
+
+            service.characteristics.forEach { c ->
+                val notify =
+                    c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+                val indicate =
+                    c.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+
+                // Ignore standard telemetry such as Battery Level and Generic Attribute.
+                // HID input and proprietary/custom notification channels are command candidates.
+                val candidate =
+                    (isHid && c.uuid == HID_INPUT_REPORT_UUID) ||
+                        (isCustom && (notify || indicate))
+
+                if (candidate && (notify || indicate)) {
+                    candidates += c
+                    commandCharacteristics += c.uuid
+                }
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            addSection(
+                "NO COMMAND CHANNEL",
+                """
+                No HID Input Report or custom NOTIFY/INDICATE characteristic was found.
+
+                This means the current connection does not expose a passive button-report channel.
+                """.trimIndent()
+            )
+            status.text = "Connected • no command notification channel found"
+            return
+        }
+
+        addSection(
+            "LISTENING",
+            candidates.joinToString("\n") {
+                "${gattUuidName(it.uuid)} • ${it.uuid} • ${properties(it.properties)}"
+            }
+        )
+
+        // Subscribe automatically. GATT descriptor writes must be serialized, otherwise
+        // Android may return BUSY and one of the command channels can be missed.
+        pendingCommandNotifications.clear()
+        commandNotificationWriteInProgress = false
+
+        candidates.forEach { c ->
+            val indication =
+                c.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0 &&
+                    c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0
+
+            pendingCommandNotifications.add(c to indication)
+        }
+
+        enableNextCommandNotification(g)
+
+        // HID Report Map is useful for interpreting the raw HID report later, but it is
+        // not a command stream, so it is intentionally not displayed as a result.
+        status.text =
+            "READY • press a button on ${safeName(g.device)}"
     }
 
     private fun renderGattService(
@@ -1782,10 +1940,84 @@ class MainActivity : Activity() {
     // NOTIFICATION / INDICATION
     // ---------------------------------------------------------
 
+    private fun enableNextCommandNotification(
+        g: BluetoothGatt
+    ) {
+
+        if (commandNotificationWriteInProgress) return
+
+        if (pendingCommandNotifications.isEmpty()) {
+            commandNotificationWriteInProgress = false
+            status.text =
+                "READY • press a button on ${safeName(g.device)}"
+            return
+        }
+
+        val next = pendingCommandNotifications.removeAt(0)
+        commandNotificationWriteInProgress = true
+
+        val (characteristic, indication) = next
+
+        if (!hasConnectPermission()) {
+            commandNotificationWriteInProgress = false
+            requestBluetoothPermissions()
+            return
+        }
+
+        try {
+            if (!g.setCharacteristicNotification(characteristic, true)) {
+                commandNotificationWriteInProgress = false
+                handler.post { enableNextCommandNotification(g) }
+                return
+            }
+
+            val cccd = characteristic.descriptors.firstOrNull {
+                it.uuid == CCCD_UUID
+            }
+
+            if (cccd == null) {
+                commandNotificationWriteInProgress = false
+                handler.post { enableNextCommandNotification(g) }
+                return
+            }
+
+            val value =
+                if (indication) {
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                } else {
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                }
+
+            if (Build.VERSION.SDK_INT >= 33) {
+                val result = g.writeDescriptor(cccd, value)
+                if (result != BluetoothStatusCodes.SUCCESS) {
+                    commandNotificationWriteInProgress = false
+                    handler.post { enableNextCommandNotification(g) }
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                cccd.value = value
+
+                @Suppress("DEPRECATION")
+                val started = g.writeDescriptor(cccd)
+
+                if (!started) {
+                    commandNotificationWriteInProgress = false
+                    handler.post { enableNextCommandNotification(g) }
+                }
+            }
+
+        } catch (_: Exception) {
+            commandNotificationWriteInProgress = false
+            handler.post { enableNextCommandNotification(g) }
+        }
+    }
+
     private fun enableNotification(
         g: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
-        indication: Boolean
+        indication: Boolean,
+        silent: Boolean = false
     ) {
 
         if (!hasConnectPermission()) {
@@ -1805,8 +2037,9 @@ class MainActivity : Activity() {
 
             if (!local) {
 
-                status.text =
-                    "Local notification registration failed"
+                if (!silent) {
+                    status.text = "Local notification registration failed"
+                }
 
                 return
             }
@@ -1818,16 +2051,9 @@ class MainActivity : Activity() {
 
             if (cccd == null) {
 
-                status.text =
-                    "CCCD descriptor not found"
-
-                addSection(
-                    "NOTIFICATION ERROR",
-                    """
-                    Characteristic: ${characteristic.uuid}
-                    CCCD descriptor was not exposed by the device.
-                    """.trimIndent()
-                )
+                if (!silent) {
+                    status.text = "Notification channel unavailable • ${characteristic.uuid}"
+                }
 
                 return
             }
@@ -1859,26 +2085,30 @@ class MainActivity : Activity() {
                     g.writeDescriptor(cccd)
                 }
 
-            status.text =
-                if (started) {
-                    if (indication) {
-                        "Indication enabling requested"
+            if (!silent) {
+                status.text =
+                    if (started) {
+                        if (indication) {
+                            "Indication enabling requested"
+                        } else {
+                            "Notification enabling requested"
+                        }
                     } else {
-                        "Notification enabling requested"
+                        "CCCD write failed to start"
                     }
-                } else {
-                    "CCCD write failed to start"
-                }
+            }
 
         } catch (e: SecurityException) {
 
-            status.text =
-                "Bluetooth permission denied"
+            if (!silent) {
+                status.text = "Bluetooth permission denied"
+            }
 
         } catch (e: Exception) {
 
-            status.text =
-                "Notification error: ${e.message}"
+            if (!silent) {
+                status.text = "Notification error: ${e.message}"
+            }
         }
     }
 
@@ -2091,19 +2321,119 @@ class MainActivity : Activity() {
         value: ByteArray
     ) {
 
-        addSection(
-            "GATT NOTIFICATION",
-            """
-            Characteristic: ${characteristic.uuid}
-            Name: ${gattUuidName(characteristic.uuid)}
+        if (!commandCaptureEnabled) return
 
-            HEX:
-            ${hex(value)}
+        // Only show channels selected by renderGatt().
+        if (characteristic.uuid !in commandCharacteristics) return
 
-            TEXT:
-            ${printable(value)}
-            """.trimIndent()
+        commandCount++
+
+        val previous = lastReportByUuid[characteristic.uuid]
+        val changed = changedBytes(previous, value)
+        lastReportByUuid[characteristic.uuid] = value.copyOf()
+
+        val label =
+            if (characteristic.uuid == HID_INPUT_REPORT_UUID) {
+                "HID BUTTON REPORT"
+            } else {
+                "DEVICE COMMAND"
+            }
+
+        val body = buildString {
+            append("Event #$commandCount\n")
+            append("Channel: $label\n")
+            append("UUID: ${characteristic.uuid}\n")
+            append("Length: ${value.size} bytes\n")
+            append("\nEXACT RAW HEX:\n")
+            append(hex(value))
+            append("\n\nChanged bytes:")
+            append(
+                if (changed.isEmpty()) {
+                    " none"
+                } else {
+                    " " + changed.joinToString(", ") { it.toString() }
+                }
+            )
+
+            if (characteristic.uuid == HID_INPUT_REPORT_UUID) {
+                append("\n\nHID interpretation: ${decodeHidReport(value)}")
+            }
+
+            append("\n\nTEXT (diagnostic only):\n")
+            append(printable(value))
+        }
+
+        val card = createSection(
+            "#$commandCount • ${if (characteristic.uuid == HID_INPUT_REPORT_UUID) "BUTTON" else "COMMAND"}"
         )
+
+        addText(card, body)
+
+        // Newest command first: move the card to the top of the result list.
+        results.removeView(card)
+        results.addView(card, 2.coerceAtMost(results.childCount))
+
+        status.text =
+            "CAPTURED #$commandCount • ${hex(value)}"
+    }
+
+    private fun changedBytes(
+        previous: ByteArray?,
+        current: ByteArray
+    ): List<Int> {
+
+        if (previous == null) {
+            return current.indices.toList()
+        }
+
+        val max = maxOf(previous.size, current.size)
+        val changed = mutableListOf<Int>()
+
+        for (i in 0 until max) {
+            val old = if (i < previous.size) previous[i].toInt() and 0xFF else -1
+            val now = if (i < current.size) current[i].toInt() and 0xFF else -1
+            if (old != now) changed += i
+        }
+
+        return changed
+    }
+
+    private fun decodeHidReport(
+        value: ByteArray
+    ): String {
+
+        if (value.isEmpty()) return "empty report"
+
+        // Do not pretend to know a proprietary mapping. For standard HID reports,
+        // expose useful byte values while keeping the exact raw report above.
+        val bytes = value.map { it.toInt() and 0xFF }
+
+        return buildString {
+            append("bytes=")
+            append(bytes.joinToString(" "))
+
+            if (bytes.size >= 2) {
+                append("; non-zero positions=")
+                append(
+                    bytes.mapIndexedNotNull { index, b ->
+                        if (b != 0) "$index:$b" else null
+                    }.joinToString(", ").ifEmpty { "none" }
+                )
+            }
+        }
+    }
+
+    private fun isCustomService(
+        uuid: UUID
+    ): Boolean {
+
+        return uuid.toString().lowercase().let {
+            it != "00001800-0000-1000-8000-00805f9b34fb" &&
+                it != "00001801-0000-1000-8000-00805f9b34fb" &&
+                it != "0000180a-0000-1000-8000-00805f9b34fb" &&
+                it != "0000180f-0000-1000-8000-00805f9b34fb" &&
+                it != "00001812-0000-1000-8000-00805f9b34fb"
+        }
     }
 
     // ---------------------------------------------------------
@@ -2168,6 +2498,12 @@ class MainActivity : Activity() {
 
             "00002a28-0000-1000-8000-00805f9b34fb" ->
                 "Software Revision String"
+
+            "00002a4b-0000-1000-8000-00805f9b34fb" ->
+                "HID Report Map"
+
+            "00002a4d-0000-1000-8000-00805f9b34fb" ->
+                "HID Input Report"
 
             CCCD_UUID.toString().lowercase() ->
                 "Client Characteristic Configuration"
