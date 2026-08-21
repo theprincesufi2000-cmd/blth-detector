@@ -654,8 +654,9 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
             if (!captureEnabled) {
                 commandLog.text =
-                    "تم اكتشاف glaze-4 كجهاز إدخال HID.\n\n" +
-                    "اضغط «بدء الالتقاط»، ثم اضغط الزر المطلوب."
+                    "تم اكتشاف glaze-4 كجهاز إدخال HID من Android.\n\n" +
+                    "اضغط «بدء الالتقاط»، ثم اضغط الزر المطلوب.\n" +
+                    "سيعرض التطبيق الحدث الذي سلّمه Android للتطبيق."
             }
         }
     }
@@ -691,7 +692,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             status.text = "التقاط HID فعال"
             commandLog.text =
                 "اضغط زرًا واحدًا فقط في glaze-4.\n\n" +
-                "سيظهر حدث HID الذي وصل إلى Android."
+                "سيظهر حدث HID الذي وصل إلى Android (KeyEvent/MotionEvent)."
         } else {
             status.text = "في انتظار قناة الأزرار"
             commandLog.text =
