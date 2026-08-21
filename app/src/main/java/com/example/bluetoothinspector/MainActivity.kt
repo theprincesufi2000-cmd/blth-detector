@@ -587,23 +587,25 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
      * delivered by Android when glaze-4 is acting as a keyboard/remote.
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (captureEnabled && isLikelyExternalInput(event)) {
-            val action =
-                when (event.action) {
-                    KeyEvent.ACTION_DOWN -> "DOWN"
-                    KeyEvent.ACTION_UP -> "UP"
-                    else -> event.action.toString()
-                }
-
+        if (captureEnabled && event.deviceId >= 0) {
+            val input = try { InputDevice.getDevice(event.deviceId) } catch (_: Exception) { null }
+            val action = when (event.action) {
+                KeyEvent.ACTION_DOWN -> "DOWN"
+                KeyEvent.ACTION_UP -> "UP"
+                else -> event.action.toString()
+            }
             val source = "0x%08X".format(event.source)
 
             showCaptured(
-                title = "HID INPUT #${++eventNumber}",
+                title = "KEY EVENT #${++eventNumber}",
                 body =
+                    "DEVICE: ${input?.name ?: "deviceId=${event.deviceId}"}\n" +
+                    "DEVICE ID: ${event.deviceId}\n" +
                     "KEY CODE: ${event.keyCode}\n" +
-                        "ACTION: $action\n" +
-                        "SOURCE: $source\n" +
-                        "SCAN CODE: ${event.scanCode}"
+                    "ACTION: $action\n" +
+                    "SOURCE: $source\n" +
+                    "SCAN CODE: ${event.scanCode}\n" +
+                    "FLAGS: 0x%08X".format(event.flags)
             )
         }
 
@@ -659,13 +661,27 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         return try {
             InputDevice.getDeviceIds().any { id ->
                 val input = InputDevice.getDevice(id) ?: return@any false
-                val name = input.name.orEmpty()
-
-                normalize(name) == normalize(targetName) &&
-                    isExternalInputDevice(input)
+                isExternalInputDevice(input)
             }
         } catch (_: Exception) {
             false
+        }
+    }
+
+    private fun systemInputDevicesText(): String {
+        return try {
+            val ids = InputDevice.getDeviceIds()
+            if (ids.isEmpty()) return "لا توجد أجهزة إدخال ظاهرة لواجهة Android."
+
+            ids.mapNotNull { id ->
+                val d = InputDevice.getDevice(id) ?: return@mapNotNull null
+                if (!isExternalInputDevice(d)) return@mapNotNull null
+                val sources = "0x%08X".format(d.sources)
+                "• ${d.name}\n  deviceId=$id\n  sources=$sources\n  descriptor=${d.descriptor ?: "N/A"}"
+            }.ifEmpty { "لا يوجد HID/Keyboard/Gamepad خارجي ظاهر حاليًا لواجهة Android." }
+                .joinToString("\n\n")
+        } catch (e: Exception) {
+            "تعذر قراءة قائمة أجهزة الإدخال: ${e.message ?: "unknown"}"
         }
     }
 
@@ -695,9 +711,9 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
             if (!captureEnabled) {
                 commandLog.text =
-                    "تم اكتشاف glaze-4 كجهاز إدخال HID من Android.\n\n" +
-                    "اضغط «بدء الالتقاط»، ثم اضغط الزر المطلوب.\n" +
-                    "سيعرض التطبيق الحدث الذي سلّمه Android للتطبيق."
+                    "تم اكتشاف جهاز إدخال خارجي من Android.\n\n" +
+                    systemInputDevicesText() +
+                    "\n\nاضغط «بدء الالتقاط»، ثم اضغط زر glaze-4."
             }
         }
     }
@@ -738,11 +754,13 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
                 "سيظهر أي KeyEvent أو MotionEvent يسلّمه Android من glaze-4.\n" +
                 "لن تتغير هذه الشاشة تلقائيًا أثناء الالتقاط."
         } else {
-            status.text = "في انتظار قناة الأزرار"
+            status.text = "التقاط الإدخال فعال — في انتظار زر"
             commandLog.text =
-                "الجهاز محدد: glaze-4\n\n" +
-                "لا توجد قناة GATT إشعار ولا HID input ظاهر في واجهة Android العامة.\n\n" +
-                "سيبقى الالتقاط فعالًا ولن يختفي هذا التنبيه. إذا سلّم Android زرًا للتطبيق فسيظهر فورًا."
+                "الجهاز المحدد: glaze-4\n\n" +
+                "أجهزة الإدخال التي يراها Android الآن:\n" +
+                systemInputDevicesText() +
+                "\n\nاضغط زرًا في glaze-4 الآن.\n" +
+                "سيُعرض أي KeyEvent حقيقي يصل إلى التطبيق فورًا، حتى لو كان اسم جهاز الإدخال مختلفًا عن glaze-4."
         }
     }
 
