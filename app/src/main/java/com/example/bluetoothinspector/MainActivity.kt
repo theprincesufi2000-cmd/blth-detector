@@ -2,131 +2,72 @@ package com.example.bluetoothinspector
 
 import android.Manifest
 import android.app.Activity
-import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
-import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.os.ParcelUuid
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.Parcelable
-import android.view.View
+import android.view.Gravity
 import android.widget.Button
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import java.nio.charset.Charset
 import java.util.UUID
-import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
 
-    private lateinit var root: LinearLayout
-    private lateinit var status: TextView
-    private lateinit var results: LinearLayout
-    private lateinit var refreshButton: Button
-    private lateinit var scanButton: Button
-
-    private val btManager by lazy {
+    private val bluetoothManager by lazy {
         getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
     }
 
     private val adapter: BluetoothAdapter?
-        get() = btManager.adapter
+        get() = bluetoothManager.adapter
 
     private var scanner: BluetoothLeScanner? = null
     private var scanning = false
     private var gatt: BluetoothGatt? = null
+    private var connectedDevice: BluetoothDevice? = null
 
-    // Command capture: only traffic that can represent a device command/report.
-    private var commandCaptureEnabled = true
-    private var commandCount = 0
-    private var lastReportByUuid = mutableMapOf<UUID, ByteArray>()
-    private val commandCharacteristics = mutableSetOf<UUID>()
-    private val commandLog = mutableListOf<String>()
+    private lateinit var root: LinearLayout
+    private lateinit var status: TextView
+    private lateinit var deviceName: TextView
+    private lateinit var receiveButton: Button
+    private lateinit var log: TextView
+    private lateinit var devicesContainer: LinearLayout
 
-    private val pendingCommandNotifications =
-        mutableListOf<Pair<BluetoothGattCharacteristic, Boolean>>()
-    private var commandNotificationWriteInProgress = false
+    // IMPORTANT:
+    // Nothing is captured until the user presses "استقبال الأوامر".
+    private var receiving = false
+    private var eventNumber = 0
+    private var lastPacket: ByteArray? = null
+    private var idlePacket: ByteArray? = null
 
-    private val HID_SERVICE_UUID =
-        UUID.fromString("00001812-0000-1000-8000-00805F9B34FB")
-    private val HID_INPUT_REPORT_UUID =
-        UUID.fromString("00002A4D-0000-1000-8000-00805F9B34FB")
-    private val HID_REPORT_MAP_UUID =
-        UUID.fromString("00002A4B-0000-1000-8000-00805F9B34FB")
-    private val BATTERY_LEVEL_UUID =
-        UUID.fromString("00002A19-0000-1000-8000-00805F9B34FB")
-    private val GENERIC_ATTRIBUTE_CHANGED_UUID =
-        UUID.fromString("00002A05-0000-1000-8000-00805F9B34FB")
-
-    private val seen = linkedMapOf<String, ScanResult>()
     private val handler = Handler(Looper.getMainLooper())
+    private val permissionRequest = 1001
 
-    private val permissionRequest = 9001
+    private val hidServiceUuid =
+        UUID.fromString("00001812-0000-1000-8000-00805F9B34FB")
 
-    private val BASE_UUID =
-        "-0000-1000-8000-00805F9B34FB"
+    private val hidInputReportUuid =
+        UUID.fromString("00002A4D-0000-1000-8000-00805F9B34FB")
 
-    private val CCCD_UUID =
+    private val cccdUuid =
         UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
 
-    // ---------------------------------------------------------
-    // CLASSIC SDP
-    // ---------------------------------------------------------
-
-    private val uuidReceiver = object : BroadcastReceiver() {
-
-        override fun onReceive(context: Context?, intent: Intent?) {
-
-            if (intent?.action != BluetoothDevice.ACTION_UUID) return
-
-            val device =
-                intent.getParcelableExtraCompat<BluetoothDevice>(
-                    BluetoothDevice.EXTRA_DEVICE
-                ) ?: return
-
-            val uuids = try {
-                device.uuids
-                    ?.map { it.uuid }
-                    ?.distinct()
-                    ?: emptyList()
-            } catch (_: SecurityException) {
-                emptyList()
-            }
-
-            runOnUiThread {
-
-                status.text =
-                    "SDP discovery completed • ${safeName(device)} • ${uuids.size} UUIDs"
-
-                renderSdpResult(device, uuids)
-            }
-        }
-    }
-
-    // ---------------------------------------------------------
-    // BLE SCAN
-    // ---------------------------------------------------------
+    private val shownAddresses = mutableSetOf<String>()
 
     private val scanCallback = object : ScanCallback() {
 
@@ -135,9 +76,7 @@ class MainActivity : Activity() {
             result: ScanResult
         ) {
             runOnUiThread {
-
-                seen[result.device.address] = result
-                renderScanResults()
+                addDeviceIfNeeded(result.device)
             }
         }
 
@@ -145,229 +84,297 @@ class MainActivity : Activity() {
             results: MutableList<ScanResult>
         ) {
             runOnUiThread {
-
-                results.forEach {
-                    seen[it.device.address] = it
-                }
-
-                renderScanResults()
+                results.forEach { addDeviceIfNeeded(it.device) }
             }
         }
 
         override fun onScanFailed(errorCode: Int) {
-
             runOnUiThread {
                 scanning = false
-                status.text = "BLE scan failed • error=$errorCode"
+                status.text = "فشل البحث"
             }
         }
     }
 
-    // ---------------------------------------------------------
-    // LIFECYCLE
-    // ---------------------------------------------------------
+    private val gattCallback = object : BluetoothGattCallback() {
+
+        override fun onConnectionStateChange(
+            g: BluetoothGatt,
+            statusCode: Int,
+            newState: Int
+        ) {
+            runOnUiThread {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    connectedDevice = g.device
+                    status.text = "متصل"
+                    deviceName.text = safeName(g.device)
+
+                    receiveButton.isEnabled = false
+                    receiving = false
+                    eventNumber = 0
+                    lastPacket = null
+                    idlePacket = null
+
+                    log.text =
+                        "اضغط «استقبال الأوامر» ثم اضغط أي زر في الجهاز الأصلي."
+
+                    try {
+                        g.discoverServices()
+                    } catch (_: SecurityException) {
+                        status.text = "صلاحية البلوتوث مرفوضة"
+                    }
+
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    receiving = false
+                    receiveButton.isEnabled = false
+                    receiveButton.text = "استقبال الأوامر"
+                    status.text = "غير متصل"
+                    log.text = "تم قطع الاتصال."
+
+                    try {
+                        g.close()
+                    } catch (_: Exception) {
+                    }
+
+                    if (gatt === g) {
+                        gatt = null
+                    }
+                }
+            }
+        }
+
+        override fun onServicesDiscovered(
+            g: BluetoothGatt,
+            statusCode: Int
+        ) {
+            runOnUiThread {
+                if (statusCode != BluetoothGatt.GATT_SUCCESS) {
+                    status.text = "فشل الاتصال بخدمات الجهاز"
+                    log.text = "لم يتمكن Android من قراءة خدمات الجهاز."
+                    return@runOnUiThread
+                }
+
+                val input = findHidInputReport(g)
+
+                if (input == null) {
+                    status.text = "متصل — لا توجد قناة HID للأزرار"
+                    log.text =
+                        "لم يتم العثور على HID Input Report (2A4D)."
+                    receiveButton.isEnabled = false
+                } else {
+                    status.text = "متصل — جاهز"
+                    log.text =
+                        "الجهاز متصل.\n\nاضغط «استقبال الأوامر» للبدء."
+                    receiveButton.isEnabled = true
+                }
+            }
+        }
+
+        // Android 13+ callback.
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            handleInputReport(characteristic, value)
+        }
+
+        // Older Android callback.
+        @Deprecated("Deprecated in Android 13")
+        override fun onCharacteristicChanged(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            handleInputReport(
+                characteristic,
+                characteristic.value ?: ByteArray(0)
+            )
+        }
+
+        override fun onDescriptorWrite(
+            g: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            statusCode: Int
+        ) {
+            if (descriptor.uuid != cccdUuid) return
+
+            runOnUiThread {
+                if (statusCode == BluetoothGatt.GATT_SUCCESS) {
+                    receiving = true
+                    status.text = "استقبال الأوامر: ON"
+                    log.text =
+                        "جاهز.\n\nاضغط أي زر في الجهاز الأصلي الآن.\n" +
+                        "ستظهر البيانات الأصلية فقط."
+                } else {
+                    receiving = false
+                    status.text = "تعذر تشغيل استقبال الأوامر"
+                    log.text =
+                        "لم يتمكن الجهاز من تفعيل استقبال HID."
+                }
+
+                receiveButton.text =
+                    if (receiving) {
+                        "إيقاف استقبال الأوامر"
+                    } else {
+                        "استقبال الأوامر"
+                    }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        window.statusBarColor = getColor(R.color.bg)
-        window.navigationBarColor = getColor(R.color.bg)
-
         buildUi()
-
-        registerReceiver(
-            uuidReceiver,
-            IntentFilter(BluetoothDevice.ACTION_UUID),
-            RECEIVER_NOT_EXPORTED
-        )
-
         requestBluetoothPermissions()
-
-        refreshLocalInfo()
+        showPairedDevices()
     }
 
     override fun onDestroy() {
-
-        stopBleScan()
+        stopScan()
 
         try {
-            unregisterReceiver(uuidReceiver)
+            gatt?.disconnect()
+            gatt?.close()
         } catch (_: Exception) {
         }
 
-        gatt?.close()
         gatt = null
-
         super.onDestroy()
     }
-
-    // ---------------------------------------------------------
-    // UI
-    // ---------------------------------------------------------
 
     private fun buildUi() {
 
         root = LinearLayout(this).apply {
-
             orientation = LinearLayout.VERTICAL
-
-            setBackgroundColor(
-                getColor(R.color.bg)
-            )
-
-            setPadding(
-                dp(16),
-                dp(12),
-                dp(16),
-                dp(16)
-            )
+            setBackgroundColor(0xFF090D12.toInt())
+            setPadding(dp(18), dp(18), dp(18), dp(18))
         }
 
-        val title = TextView(this).apply {
-
-            text = "Bluetooth Inspector Pro"
-
-            textSize = 25f
-
-            setTextColor(
-                getColor(R.color.text)
-            )
-
-            typeface =
-                android.graphics.Typeface.DEFAULT_BOLD
-        }
-
-        root.addView(
-            title,
-            lp(-1, -2)
+        val title = text(
+            "Bluetooth Command Capture",
+            25f,
+            true
         )
+        root.addView(title, lp(-1, -2))
 
-        val subtitle = TextView(this).apply {
-
-            text =
-                "Command Capture • HID Reports • Custom Bluetooth Commands"
-
-            textSize = 13f
-
-            setTextColor(
-                getColor(R.color.muted)
-            )
-
+        status = text(
+            "اختر الجهاز المقترن",
+            15f,
+            false
+        ).apply {
+            setTextColor(0xFF6EE78A.toInt())
             setPadding(
-                0,
-                dp(4),
-                0,
-                dp(10)
+                dp(14),
+                dp(14),
+                dp(14),
+                dp(14)
             )
-        }
-
-        root.addView(
-            subtitle,
-            lp(-1, -2)
-        )
-
-        status = TextView(this).apply {
-
-            textSize = 14f
-
-            setTextColor(
-                getColor(R.color.green)
-            )
-
-            setPadding(
-                dp(12),
-                dp(10),
-                dp(12),
-                dp(10)
-            )
-
-            setBackgroundColor(
-                getColor(R.color.panel)
-            )
+            setBackgroundColor(0xFF121A24.toInt())
         }
 
         root.addView(
             status,
-            lp(-1, -2)
+            marginLp(-1, -2, 0, 10, 0, 10)
         )
 
-        val buttons =
-            LinearLayout(this).apply {
-                orientation =
-                    LinearLayout.HORIZONTAL
-            }
-
-        refreshButton = button("Refresh")
-        scanButton = button("Scan BLE")
-
-        val stopButton = button("Stop")
-        val pairedButton = button("Paired")
-
-        buttons.addView(
-            refreshButton,
-            weightLp()
-        )
-
-        buttons.addView(
-            scanButton,
-            weightLp()
-        )
-
-        buttons.addView(
-            stopButton,
-            weightLp()
-        )
-
-        buttons.addView(
-            pairedButton,
-            weightLp()
+        deviceName = text(
+            "لا يوجد جهاز متصل",
+            20f,
+            true
         )
 
         root.addView(
-            buttons,
+            deviceName,
+            marginLp(-1, -2, 0, 8, 0, 8)
+        )
+
+        val scan = Button(this).apply {
+            text = "البحث عن الجهاز"
+            setOnClickListener {
+                startScan()
+            }
+        }
+
+        root.addView(
+            scan,
+            marginLp(-1, -2, 0, 6, 0, 6)
+        )
+
+        receiveButton = Button(this).apply {
+            text = "استقبال الأوامر"
+            isEnabled = false
+
+            setOnClickListener {
+                if (receiving) {
+                    stopReceiving()
+                } else {
+                    startReceiving()
+                }
+            }
+        }
+
+        root.addView(
+            receiveButton,
+            marginLp(-1, -2, 0, 6, 0, 12)
+        )
+
+        val deviceTitle = text(
+            "الأجهزة المقترنة",
+            17f,
+            true
+        )
+
+        root.addView(
+            deviceTitle,
             lp(-1, -2)
         )
 
-        refreshButton.setOnClickListener {
-            refreshLocalInfo()
+        devicesContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
 
-        scanButton.setOnClickListener {
-            startBleScan()
+        val deviceScroll = ScrollView(this).apply {
+            addView(devicesContainer)
         }
-
-        stopButton.setOnClickListener {
-            stopBleScan()
-        }
-
-        pairedButton.setOnClickListener {
-            renderPaired()
-        }
-
-        // The inspector is intentionally command-focused after a GATT connection.
-        // No GATT database is shown until the user asks for it from the connection.
-
-        val scroll =
-            ScrollView(this)
-
-        results =
-            LinearLayout(this).apply {
-
-                orientation =
-                    LinearLayout.VERTICAL
-
-                setPadding(
-                    0,
-                    dp(12),
-                    0,
-                    dp(30)
-                )
-            }
-
-        scroll.addView(results)
 
         root.addView(
-            scroll,
+            deviceScroll,
+            LinearLayout.LayoutParams(-1, dp(150))
+        )
+
+        val commandTitle = text(
+            "الأمر المستلم",
+            17f,
+            true
+        )
+
+        root.addView(
+            commandTitle,
+            marginLp(-1, -2, 0, 12, 0, 6)
+        )
+
+        log = text(
+            "بعد الاتصال اضغط «استقبال الأوامر» ثم اضغط زرًا في الجهاز.",
+            16f,
+            false
+        ).apply {
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextColor(0xFFE8EDF3.toInt())
+            setPadding(
+                dp(14),
+                dp(14),
+                dp(14),
+                dp(14)
+            )
+            setBackgroundColor(0xFF111820.toInt())
+        }
+
+        val logScroll = ScrollView(this).apply {
+            addView(log)
+        }
+
+        root.addView(
+            logScroll,
             LinearLayout.LayoutParams(
                 -1,
                 0,
@@ -378,458 +385,322 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    // ---------------------------------------------------------
-    // LOCAL ADAPTER
-    // ---------------------------------------------------------
+    private fun showPairedDevices() {
 
-    private fun refreshLocalInfo() {
-
-        results.removeAllViews()
+        devicesContainer.removeAllViews()
+        shownAddresses.clear()
 
         val a = adapter
 
         if (a == null) {
-
-            status.text =
-                "Bluetooth adapter not available"
-
+            status.text = "البلوتوث غير متوفر"
             return
         }
 
-        val enabled =
-            try {
-                a.isEnabled
-            } catch (_: SecurityException) {
-                false
-            }
-
-        status.text =
-            "Bluetooth: ${if (enabled) "ON" else "OFF"} • Android ${Build.VERSION.RELEASE} • API ${Build.VERSION.SDK_INT}"
-
-        addSection(
-            "LOCAL ADAPTER",
-            """
-            Name: ${tryName(a)}
-            Address: ${tryAddress(a)}
-            Enabled: $enabled
-            State: ${tryState(a)}
-            Bluetooth supported: ${packageManager.hasSystemFeature("android.hardware.bluetooth")}
-            BLE supported: ${packageManager.hasSystemFeature("android.hardware.bluetooth_le")}
-            """.trimIndent()
-        )
-
-        renderPaired()
-    }
-
-    // ---------------------------------------------------------
-    // PAIRED DEVICES
-    // ---------------------------------------------------------
-
-    private fun renderPaired() {
-
-        val a = adapter ?: return
-
-        addSection(
-            "BONDED / PAIRED DEVICES",
-            ""
-        )
-
-        val devices =
-            try {
-                a.bondedDevices.toList()
-            } catch (_: SecurityException) {
-                emptyList()
-            }
+        val devices = try {
+            a.bondedDevices.toList()
+        } catch (_: SecurityException) {
+            emptyList()
+        }
 
         if (devices.isEmpty()) {
-
-            addSection(
-                "PAIRED",
-                "No paired devices visible to this application."
+            devicesContainer.addView(
+                text(
+                    "لا يوجد جهاز مقترن. اقترن بالجهاز من إعدادات Bluetooth أولاً.",
+                    14f,
+                    false
+                )
             )
-
             return
         }
 
         devices
-            .sortedBy {
-                safeName(it)
-            }
+            .sortedBy { safeName(it) }
             .forEach {
-
-                renderDeviceCard(
-                    it,
-                    null,
-                    "PAIRED"
-                )
+                addDeviceIfNeeded(it)
             }
     }
 
-    // ---------------------------------------------------------
-    // CLASSIC DEVICE CARD
-    // ---------------------------------------------------------
-
-    private fun renderDeviceCard(
-        device: BluetoothDevice,
-        result: ScanResult?,
-        tag: String
+    private fun addDeviceIfNeeded(
+        device: BluetoothDevice
     ) {
-
-        val body =
-            buildString {
-
-                append(
-                    "Name: ${safeName(device)}\n"
-                )
-
-                append(
-                    "Address: ${safeAddress(device)}\n"
-                )
-
-                append(
-                    "Type: ${typeName(device.type)}\n"
-                )
-
-                append(
-                    "Bond: ${bondName(device.bondState)}\n"
-                )
-
-                if (result != null) {
-
-                    append(
-                        "RSSI: ${result.rssi} dBm\n"
-                    )
-                }
-
-                val clazz =
-                    try {
-                        device.bluetoothClass
-                    } catch (_: SecurityException) {
-                        null
-                    }
-
-                if (clazz != null) {
-
-                    append(
-                        "Class: ${clazz.deviceClass} (${clazz.majorDeviceClass})\n"
-                    )
-
-                    append(
-                        "Class hex: 0x${clazz.hashCode().toString(16)}\n"
-                    )
-                }
-
-                val uuids =
-                    try {
-                        device.uuids
-                            ?.joinToString("\n") {
-                                it.uuid.toString()
-                            }
-                    } catch (_: SecurityException) {
-                        null
-                    }
-
-                append(
-                    "Cached UUIDs:\n${uuids ?: "none"}"
-                )
-            }
-
-        val card =
-            createSection(
-                "$tag • ${safeName(device)}"
-            )
-
-        addText(
-            card,
-            body
-        )
-
-        val row =
-            LinearLayout(this).apply {
-                orientation =
-                    LinearLayout.HORIZONTAL
-            }
-
-        val sdpButton =
-            button("Inspect SDP")
-
-        val fetchButton =
-            button("Fetch UUIDs")
-
-        row.addView(
-            sdpButton,
-            weightLp()
-        )
-
-        row.addView(
-            fetchButton,
-            weightLp()
-        )
-
-        sdpButton.setOnClickListener {
-            inspectSdp(device)
+        val address = try {
+            device.address
+        } catch (_: SecurityException) {
+            return
         }
 
-        fetchButton.setOnClickListener {
-            inspectSdp(device)
+        if (!shownAddresses.add(address)) return
+
+        val button = Button(this).apply {
+            text = safeName(device)
+            gravity = Gravity.CENTER_VERTICAL
+
+            setOnClickListener {
+                connectToDevice(device)
+            }
         }
 
-        card.addView(
-            row,
-            lp(-1, -2)
+        devicesContainer.addView(
+            button,
+            marginLp(-1, -2, 0, 4, 0, 4)
         )
     }
 
-    // ---------------------------------------------------------
-    // SDP
-    // ---------------------------------------------------------
-
-    private fun inspectSdp(
+    private fun connectToDevice(
         device: BluetoothDevice
     ) {
 
+        stopScan()
+
         if (!hasConnectPermission()) {
-
             requestBluetoothPermissions()
-
             return
         }
 
         try {
+            gatt?.disconnect()
+            gatt?.close()
+            gatt = null
 
-            status.text =
-                "SDP UUID discovery requested for ${safeName(device)}"
+            receiving = false
+            eventNumber = 0
+            lastPacket = null
+            idlePacket = null
 
-            val requested =
-                if (Build.VERSION.SDK_INT >= 33) {
-                    device.fetchUuidsWithSdp()
+            receiveButton.isEnabled = false
+            receiveButton.text = "استقبال الأوامر"
+
+            status.text = "جارٍ الاتصال…"
+            deviceName.text = safeName(device)
+            log.text = "جارٍ الاتصال بالجهاز…"
+
+            gatt =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    device.connectGatt(
+                        this,
+                        false,
+                        gattCallback,
+                        BluetoothDevice.TRANSPORT_LE
+                    )
                 } else {
                     @Suppress("DEPRECATION")
-                    device.fetchUuidsWithSdp()
+                    device.connectGatt(
+                        this,
+                        false,
+                        gattCallback
+                    )
                 }
 
-            if (!requested) {
+        } catch (_: Exception) {
+            status.text = "فشل الاتصال"
+            log.text = "تعذر الاتصال بالجهاز."
+        }
+    }
 
-                status.text =
-                    "SDP request was not accepted by Android"
+    private fun startReceiving() {
+
+        if (!hasConnectPermission()) {
+            requestBluetoothPermissions()
+            return
+        }
+
+        val g = gatt ?: return
+        val input = findHidInputReport(g)
+
+        if (input == null) {
+            status.text = "لا توجد قناة أزرار HID"
+            return
+        }
+
+        try {
+            // This is the ONLY notification we enable.
+            // No custom notification channels are subscribed.
+            val local =
+                g.setCharacteristicNotification(
+                    input,
+                    true
+                )
+
+            if (!local) {
+                status.text = "تعذر تفعيل استقبال الأوامر"
+                return
             }
 
-        } catch (e: SecurityException) {
+            val descriptor =
+                input.getDescriptor(cccdUuid)
 
-            status.text =
-                "Bluetooth permission denied"
+            if (descriptor == null) {
+                status.text = "قناة HID لا تحتوي CCCD"
+                return
+            }
 
-        } catch (e: Exception) {
+            descriptor.value =
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
 
-            status.text =
-                "SDP error: ${e.message}"
+            val started =
+                g.writeDescriptor(descriptor)
+
+            if (!started) {
+                status.text = "تعذر بدء استقبال الأوامر"
+            }
+
+        } catch (_: Exception) {
+            status.text = "تعذر بدء استقبال الأوامر"
         }
     }
 
-    private fun renderSdpResult(
-        device: BluetoothDevice,
-        uuids: List<UUID>
+    private fun stopReceiving() {
+
+        if (!hasConnectPermission()) {
+            requestBluetoothPermissions()
+            return
+        }
+
+        val g = gatt
+        val input =
+            g?.let {
+                findHidInputReport(it)
+            }
+
+        if (g != null && input != null) {
+            try {
+                g.setCharacteristicNotification(
+                    input,
+                    false
+                )
+
+                input.getDescriptor(cccdUuid)?.let {
+                    it.value =
+                        BluetoothGattDescriptor
+                            .DISABLE_NOTIFICATION_VALUE
+
+                    g.writeDescriptor(it)
+                }
+
+            } catch (_: Exception) {
+            }
+        }
+
+        receiving = false
+        receiveButton.text = "استقبال الأوامر"
+        status.text = "الاستقبال متوقف"
+        log.text =
+            "اضغط «استقبال الأوامر» عندما تريد التقاط زر جديد."
+    }
+
+    private fun findHidInputReport(
+        g: BluetoothGatt
+    ): BluetoothGattCharacteristic? {
+
+        val hidService =
+            g.getService(hidServiceUuid)
+                ?: g.services.firstOrNull {
+                    it.uuid == hidServiceUuid
+                }
+
+        return hidService
+            ?.getCharacteristic(hidInputReportUuid)
+            ?: g.services
+                .flatMap {
+                    it.characteristics
+                }
+                .firstOrNull {
+                    it.uuid == hidInputReportUuid
+                }
+    }
+
+    private fun handleInputReport(
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray
     ) {
 
-        val card =
-            createSection(
-                "CLASSIC SDP / UUID DISCOVERY"
-            )
+        // Nothing is recorded before the button is pressed.
+        if (!receiving) return
 
-        addText(
-            card,
-            """
-            Device: ${safeName(device)}
-            Address: ${safeAddress(device)}
-            Type: ${typeName(device.type)}
-            Bond: ${bondName(device.bondState)}
-            UUIDs discovered: ${uuids.size}
-            """.trimIndent()
-        )
-
-        if (uuids.isEmpty()) {
-
-            addText(
-                card,
-                "No UUIDs returned by the Bluetooth stack."
-            )
-
+        // Absolute filter: only HID Input Report.
+        if (characteristic.uuid != hidInputReportUuid) {
             return
         }
 
-        uuids.forEach { uuid ->
+        if (value.isEmpty()) return
 
-            val service =
-                LinearLayout(this).apply {
+        runOnUiThread {
 
-                    orientation =
-                        LinearLayout.VERTICAL
+            // HID devices often send the same idle report continuously.
+            // Do not show those repeats as button commands.
+            if (lastPacket != null && lastPacket!!.contentEquals(value)) {
+                return@runOnUiThread
+            }
 
-                    setPadding(
-                        dp(10),
-                        dp(10),
-                        dp(10),
-                        dp(10)
-                    )
+            if (idlePacket == null) {
+                idlePacket = value.clone()
+                lastPacket = value.clone()
+                return@runOnUiThread
+            }
 
-                    setBackgroundColor(
-                        getColor(R.color.bg)
-                    )
-                }
+            // Returning to the idle report is a release, not a new button command.
+            if (idlePacket!!.contentEquals(value)) {
+                lastPacket = value.clone()
+                return@runOnUiThread
+            }
 
-            val title =
-                TextView(this).apply {
+            eventNumber++
 
-                    text =
-                        profileName(uuid)
-
-                    textSize = 15f
-
-                    typeface =
-                        android.graphics.Typeface.DEFAULT_BOLD
-
-                    setTextColor(
-                        getColor(R.color.text)
+            val hex =
+                value.joinToString(" ") {
+                    "%02X".format(
+                        it.toInt() and 0xFF
                     )
                 }
 
-            service.addView(
-                title,
-                lp(-1, -2)
-            )
+            val previous = lastPacket
 
-            val detail =
-                TextView(this).apply {
-
-                    text =
-                        "UUID: ${uuid.toString().uppercase()}\n" +
-                        "Category: ${uuidCategory(uuid)}"
-
-                    textSize = 12f
-
-                    setTextColor(
-                        getColor(R.color.muted)
-                    )
-
-                    typeface =
-                        android.graphics.Typeface.MONOSPACE
+            val changed =
+                if (previous == null) {
+                    "أول تقرير"
+                } else {
+                    value.indices
+                        .filter { index ->
+                            index >= previous.size ||
+                                value[index] != previous[index]
+                        }
+                        .joinToString(", ") {
+                            (it + 1).toString()
+                        }
+                        .ifEmpty {
+                            "لا يوجد تغيير"
+                        }
                 }
 
-            service.addView(
-                detail,
-                lp(-1, -2)
-            )
-
-            card.addView(
-                service,
-                lp(-1, -2)
-            )
-        }
-    }
-
-    private fun profileName(
-        uuid: UUID
-    ): String {
-
-        return when (uuid.toString().lowercase()) {
-
-            "00001101-0000-1000-8000-00805f9b34fb" ->
-                "Serial Port Profile (SPP)"
-
-            "00001108-0000-1000-8000-00805f9b34fb" ->
-                "Headset Profile (HSP)"
-
-            "0000110a-0000-1000-8000-00805f9b34fb" ->
-                "A2DP Source"
-
-            "0000110b-0000-1000-8000-00805f9b34fb" ->
-                "A2DP Sink"
-
-            "0000110c-0000-1000-8000-00805f9b34fb" ->
-                "A/V Remote Control Target"
-
-            "0000110d-0000-1000-8000-00805f9b34fb" ->
-                "Advanced Audio Distribution"
-
-            "0000110e-0000-1000-8000-00805f9b34fb" ->
-                "A/V Remote Control / AVRCP"
-
-            "00001112-0000-1000-8000-00805f9b34fb" ->
-                "Headset Audio Gateway"
-
-            "0000111e-0000-1000-8000-00805f9b34fb" ->
-                "Hands-Free Profile (HFP)"
-
-            "0000111f-0000-1000-8000-00805f9b34fb" ->
-                "Hands-Free Audio Gateway"
-
-            "00001115-0000-1000-8000-00805f9b34fb" ->
-                "PAN User"
-
-            "00001116-0000-1000-8000-00805f9b34fb" ->
-                "PAN Network Access Point"
-
-            "00001124-0000-1000-8000-00805f9b34fb" ->
-                "Human Interface Device (HID)"
-
-            "0000112f-0000-1000-8000-00805f9b34fb" ->
-                "Phonebook Access Server"
-
-            "00001132-0000-1000-8000-00805f9b34fb" ->
-                "Message Access Server"
-
-            "00001133-0000-1000-8000-00805f9b34fb" ->
-                "Message Notification Server"
-
-            "00001200-0000-1000-8000-00805f9b34fb" ->
-                "PnP Information"
-
-            else ->
-                "Unknown / Custom Classic Service"
-        }
-    }
-
-    private fun uuidCategory(
-        uuid: UUID
-    ): String {
-
-        val value =
-            uuid.toString().lowercase()
-
-        return when {
-
-            value.endsWith(
-                "-0000-1000-8000-00805f9b34fb"
-            ) ->
-                "Bluetooth SIG 16-bit based UUID"
-
-            else ->
-                "Custom UUID"
-        }
-    }
-
-    // ---------------------------------------------------------
-    // BLE SCAN
-    // ---------------------------------------------------------
-
-    private fun startBleScan() {
-
-        if (!hasScanPermission()) {
-
-            requestBluetoothPermissions()
-
-            return
-        }
-
-        val a = adapter
-
-        if (a == null) {
+            lastPacket = value.clone()
 
             status.text =
-                "Bluetooth adapter unavailable"
+                "تم استقبال الأمر #$eventNumber"
 
+            log.text =
+                """
+                الأمر #$eventNumber
+
+                HEX الأصلي:
+                $hex
+
+                البايتات المتغيرة:
+                $changed
+
+                اضغط زرًا آخر لتسجيله.
+                """.trimIndent()
+        }
+    }
+
+    private fun startScan() {
+
+        if (!hasScanPermission()) {
+            requestBluetoothPermissions()
             return
         }
+
+        val a = adapter ?: return
 
         val enabled =
             try {
@@ -839,19 +710,22 @@ class MainActivity : Activity() {
             }
 
         if (!enabled) {
-
-            startActivity(
-                Intent(
-                    BluetoothAdapter.ACTION_REQUEST_ENABLE
+            try {
+                startActivity(
+                    Intent(
+                        BluetoothAdapter.ACTION_REQUEST_ENABLE
+                    )
                 )
-            )
-
+            } catch (_: Exception) {
+            }
             return
         }
 
         if (scanning) return
 
-        seen.clear()
+        shownAddresses.clear()
+        devicesContainer.removeAllViews()
+        status.text = "جارٍ البحث…"
 
         scanner =
             try {
@@ -861,2426 +735,167 @@ class MainActivity : Activity() {
             }
 
         if (scanner == null) {
-
-            status.text =
-                "BLE scanner unavailable"
-
+            status.text = "ماسح BLE غير متوفر"
             return
         }
 
         scanning = true
 
-        status.text =
-            "BLE scan running…"
-
-        renderScanResults()
-
         try {
-
-            val settings =
+            scanner?.startScan(
+                null,
                 ScanSettings.Builder()
                     .setScanMode(
                         ScanSettings.SCAN_MODE_LOW_LATENCY
                     )
-                    .build()
-
-            scanner?.startScan(
-                null,
-                settings,
+                    .build(),
                 scanCallback
             )
 
-            handler.removeCallbacksAndMessages(null)
-
             handler.postDelayed(
                 {
-                    stopBleScan()
+                    stopScan()
                 },
-                15000
+                12000
             )
 
-        } catch (e: SecurityException) {
-
+        } catch (_: Exception) {
             scanning = false
-
-            status.text =
-                "BLE permission denied"
-
-        } catch (e: Exception) {
-
-            scanning = false
-
-            status.text =
-                "BLE scan error: ${e.message}"
+            status.text = "فشل البحث"
         }
     }
 
-    private fun stopBleScan() {
+    private fun stopScan() {
 
         handler.removeCallbacksAndMessages(null)
 
         if (!scanning) return
 
         try {
-
-            scanner?.stopScan(
-                scanCallback
-            )
-
+            scanner?.stopScan(scanCallback)
         } catch (_: Exception) {
         }
 
         scanning = false
 
         status.text =
-            "BLE scan stopped • ${seen.size} devices"
+            if (connectedDevice != null) {
+                "متصل"
+            } else {
+                "البحث متوقف"
+            }
     }
 
-    // ---------------------------------------------------------
-    // BLE RESULTS
-    // ---------------------------------------------------------
+    private fun requestBluetoothPermissions() {
 
-    private fun renderScanResults() {
+        val permissions =
+            mutableListOf<String>()
 
-        val card =
-            findOrCreateSection(
-                "LIVE BLE SCAN"
-            )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions +=
+                Manifest.permission.BLUETOOTH_SCAN
 
-        card.removeAllViews()
-
-        addHeader(
-            card,
-            "LIVE BLE SCAN",
-            "${seen.size} devices"
-        )
-
-        if (seen.isEmpty()) {
-
-            addText(
-                card,
-                "No BLE advertisements captured yet."
-            )
-
-            return
+            permissions +=
+                Manifest.permission.BLUETOOTH_CONNECT
+        } else {
+            permissions +=
+                Manifest.permission.ACCESS_FINE_LOCATION
         }
 
-        val sorted =
-            seen.values
-                .sortedByDescending {
-                    it.rssi
-                }
-
-        sorted.forEach { result ->
-
-            val device =
-                result.device
-
-            val record =
-                result.scanRecord
-
-            val item =
-                LinearLayout(this).apply {
-
-                    orientation =
-                        LinearLayout.VERTICAL
-
-                    setPadding(
-                        dp(12),
-                        dp(12),
-                        dp(12),
-                        dp(12)
-                    )
-
-                    setBackgroundColor(
-                        getColor(R.color.bg)
-                    )
-                }
-
-            addText(
-                item,
-                buildString {
-
-                    append(
-                        "Name: ${safeName(device)}\n"
-                    )
-
-                    append(
-                        "Address: ${safeAddress(device)}\n"
-                    )
-
-                    append(
-                        "RSSI: ${result.rssi} dBm\n"
-                    )
-
-                    append(
-                        "TX Power: ${
-                            if (
-                                result.txPower !=
-                                ScanResult.TX_POWER_NOT_PRESENT
-                            ) {
-                                result.txPower
-                            } else {
-                                "N/A"
-                            }
-                        }\n"
-                    )
-
-                    append(
-                        "Connectable: ${
-                            if (Build.VERSION.SDK_INT >= 26) {
-                                result.isConnectable
-                            } else {
-                                "unknown"
-                            }
-                        }\n"
-                    )
-
-                    append(
-                        "Device Type: ${typeName(device.type)}\n"
-                    )
-
-                    if (record != null) {
-
-                        append(
-                            "Advertise Flags: ${record.advertiseFlags}\n"
-                        )
-
-                        append(
-                            "Service UUIDs: ${
-                                record.serviceUuids
-                                    ?.joinToString {
-                                        it.uuid.toString()
-                                    }
-                                    ?: "none"
-                            }\n"
-                        )
-
-                        append(
-                            "Service Data:\n${formatMap(record.serviceData)}\n"
-                        )
-
-                        append(
-                            "Manufacturer Data:\n${
-                                formatManufacturer(
-                                    record.manufacturerSpecificData
-                                )
-                            }\n"
-                        )
-
-                        append(
-                            "Raw Advertisement:\n${hex(record.bytes)}"
-                        )
-                    }
-                }
-            )
-
-            val actions =
-                LinearLayout(this).apply {
-                    orientation =
-                        LinearLayout.HORIZONTAL
-                }
-
-            val connect =
-                button("Connect GATT")
-
-            val details =
-                button("Details")
-
-            actions.addView(
-                connect,
-                weightLp()
-            )
-
-            actions.addView(
-                details,
-                weightLp()
-            )
-
-            connect.setOnClickListener {
-
-                if (
-                    device.type ==
-                    BluetoothDevice.DEVICE_TYPE_CLASSIC
-                ) {
-
-                    status.text =
-                        "This device is Classic Bluetooth, not BLE."
-
-                } else {
-
-                    connectGatt(device)
-                }
+        val needed =
+            permissions.filter {
+                checkSelfPermission(it) !=
+                    PackageManager.PERMISSION_GRANTED
             }
 
-            details.setOnClickListener {
-
-                showBleDetails(
-                    result
-                )
-            }
-
-            item.addView(
-                actions,
-                lp(-1, -2)
-            )
-
-            card.addView(
-                item,
-                lp(-1, -2)
+        if (needed.isNotEmpty()) {
+            requestPermissions(
+                needed.toTypedArray(),
+                permissionRequest
             )
         }
     }
 
-    private fun showBleDetails(
-        result: ScanResult
-    ) {
-
-        val record =
-            result.scanRecord
-
-        val text =
-            buildString {
-
-                append(
-                    "Name: ${safeName(result.device)}\n\n"
-                )
-
-                append(
-                    "Address: ${safeAddress(result.device)}\n\n"
-                )
-
-                append(
-                    "RSSI: ${result.rssi} dBm\n"
-                )
-
-                append(
-                    "TX Power: ${result.txPower}\n"
-                )
-
-                if (record != null) {
-
-                    append(
-                        "\nService UUIDs:\n"
-                    )
-
-                    append(
-                        record.serviceUuids
-                            ?.joinToString("\n") {
-                                it.uuid.toString()
-                            }
-                            ?: "none"
-                    )
-
-                    append(
-                        "\n\nManufacturer Data:\n"
-                    )
-
-                    append(
-                        formatManufacturer(
-                            record.manufacturerSpecificData
-                        )
-                    )
-
-                    append(
-                        "\n\nService Data:\n"
-                    )
-
-                    append(
-                        formatMap(
-                            record.serviceData
-                        )
-                    )
-
-                    append(
-                        "\n\nRaw Advertisement:\n"
-                    )
-
-                    append(
-                        hex(record.bytes)
-                    )
-                }
-            }
-
-        AlertDialog.Builder(this)
-            .setTitle("BLE Advertisement")
-            .setMessage(text)
-            .setPositiveButton(
-                "Close",
-                null
-            )
-            .show()
+    private fun hasConnectPermission(): Boolean {
+        return Build.VERSION.SDK_INT <
+            Build.VERSION_CODES.S ||
+            checkSelfPermission(
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
     }
 
-    // ---------------------------------------------------------
-    // GATT CONNECTION
-    // ---------------------------------------------------------
+    private fun hasScanPermission(): Boolean {
+        return Build.VERSION.SDK_INT <
+            Build.VERSION_CODES.S ||
+            checkSelfPermission(
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+    }
 
-    private fun connectGatt(
+    private fun safeName(
         device: BluetoothDevice
-    ) {
-
-        if (!hasConnectPermission()) {
-
-            requestBluetoothPermissions()
-
-            return
-        }
-
-        try {
-            gatt?.disconnect()
-        } catch (_: Exception) {
-        }
-
-        try {
-            gatt?.close()
-        } catch (_: Exception) {
-        }
-
-        gatt = null
-
-        status.text =
-            "Connecting GATT: ${safeName(device)}"
-
-        try {
-
-            gatt =
-                if (Build.VERSION.SDK_INT >= 26) {
-
-                    device.connectGatt(
-                        this,
-                        false,
-                        gattCallback,
-                        BluetoothDevice.TRANSPORT_LE
-                    )
-
-                } else {
-
-                    @Suppress("DEPRECATION")
-                    device.connectGatt(
-                        this,
-                        false,
-                        gattCallback
-                    )
-                }
-
-        } catch (e: SecurityException) {
-
-            status.text =
-                "GATT permission denied"
-
-        } catch (e: Exception) {
-
-            status.text =
-                "GATT connection error: ${e.message}"
-        }
-    }
-
-    // ---------------------------------------------------------
-    // GATT CALLBACK
-    // ---------------------------------------------------------
-
-    private val gattCallback =
-        object : BluetoothGattCallback() {
-
-            override fun onConnectionStateChange(
-                g: BluetoothGatt,
-                statusCode: Int,
-                newState: Int
-            ) {
-
-                runOnUiThread {
-
-                    when (newState) {
-
-                        BluetoothProfile.STATE_CONNECTED -> {
-
-                            status.text =
-                                "GATT CONNECTED • ${safeName(g.device)}"
-
-                            addSection(
-                                "GATT CONNECTION",
-                                """
-                                Device: ${safeName(g.device)}
-                                Address: ${safeAddress(g.device)}
-                                State: CONNECTED
-                                Status code: $statusCode
-                                """.trimIndent()
-                            )
-
-                            try {
-
-                                g.discoverServices()
-
-                            } catch (e: Exception) {
-
-                                status.text =
-                                    "Service discovery error: ${e.message}"
-                            }
-                        }
-
-                        BluetoothProfile.STATE_DISCONNECTED -> {
-
-                            commandCharacteristics.clear()
-                            lastReportByUuid.clear()
-
-                            status.text =
-                                "GATT DISCONNECTED • ${safeName(g.device)}"
-
-                            addSection(
-                                "GATT CONNECTION",
-                                """
-                                Device: ${safeName(g.device)}
-                                Address: ${safeAddress(g.device)}
-                                State: DISCONNECTED
-                                Status code: $statusCode
-                                """.trimIndent()
-                            )
-                        }
-
-                        else -> {
-
-                            status.text =
-                                "GATT state=$newState status=$statusCode"
-                        }
-                    }
-                }
-            }
-
-            override fun onServicesDiscovered(
-                g: BluetoothGatt,
-                statusCode: Int
-            ) {
-
-                runOnUiThread {
-
-                    renderGatt(
-                        g,
-                        statusCode
-                    )
-                }
-            }
-
-            // Android 13+
-            override fun onCharacteristicRead(
-                g: BluetoothGatt,
-                c: BluetoothGattCharacteristic,
-                value: ByteArray,
-                statusCode: Int
-            ) {
-
-                runOnUiThread {
-
-                    renderGattData(
-                        "GATT READ",
-                        c.uuid,
-                        value,
-                        statusCode
-                    )
-                }
-            }
-
-            // Older Android
-            @Deprecated("Deprecated in Android 13")
-            override fun onCharacteristicRead(
-                g: BluetoothGatt,
-                c: BluetoothGattCharacteristic,
-                statusCode: Int
-            ) {
-
-                if (Build.VERSION.SDK_INT < 33) {
-
-                    val value =
-                        c.value ?: ByteArray(0)
-
-                    runOnUiThread {
-
-                        renderGattData(
-                            "GATT READ",
-                            c.uuid,
-                            value,
-                            statusCode
-                        )
-                    }
-                }
-            }
-
-            // Android 13+
-            override fun onCharacteristicChanged(
-                g: BluetoothGatt,
-                c: BluetoothGattCharacteristic,
-                value: ByteArray
-            ) {
-
-                runOnUiThread {
-
-                    renderNotification(
-                        c,
-                        value
-                    )
-                }
-            }
-
-            // Older Android
-            @Deprecated("Deprecated in Android 13")
-            override fun onCharacteristicChanged(
-                g: BluetoothGatt,
-                c: BluetoothGattCharacteristic
-            ) {
-
-                if (Build.VERSION.SDK_INT < 33) {
-
-                    val value =
-                        c.value ?: ByteArray(0)
-
-                    runOnUiThread {
-
-                        renderNotification(
-                            c,
-                            value
-                        )
-                    }
-                }
-            }
-
-            override fun onCharacteristicWrite(
-                g: BluetoothGatt,
-                c: BluetoothGattCharacteristic,
-                statusCode: Int
-            ) {
-
-                runOnUiThread {
-
-                    addSection(
-                        "GATT WRITE RESULT",
-                        """
-                        Characteristic: ${c.uuid}
-                        Status: $statusCode
-                        """.trimIndent()
-                    )
-                }
-            }
-
-            // Android 13+
-            override fun onDescriptorRead(
-                g: BluetoothGatt,
-                d: BluetoothGattDescriptor,
-                statusCode: Int,
-                value: ByteArray
-            ) {
-
-                runOnUiThread {
-
-                    addSection(
-                        "DESCRIPTOR READ",
-                        """
-                        Descriptor: ${d.uuid}
-                        Status: $statusCode
-                        HEX: ${hex(value)}
-                        TEXT: ${printable(value)}
-                        """.trimIndent()
-                    )
-                }
-            }
-
-            // Older Android
-            @Deprecated("Deprecated in Android 13")
-            override fun onDescriptorRead(
-                g: BluetoothGatt,
-                d: BluetoothGattDescriptor,
-                statusCode: Int
-            ) {
-
-                if (Build.VERSION.SDK_INT < 33) {
-
-                    val value =
-                        d.value ?: ByteArray(0)
-
-                    runOnUiThread {
-
-                        addSection(
-                            "DESCRIPTOR READ",
-                            """
-                            Descriptor: ${d.uuid}
-                            Status: $statusCode
-                            HEX: ${hex(value)}
-                            TEXT: ${printable(value)}
-                            """.trimIndent()
-                        )
-                    }
-                }
-            }
-
-            override fun onDescriptorWrite(
-                g: BluetoothGatt,
-                d: BluetoothGattDescriptor,
-                statusCode: Int
-            ) {
-
-                if (d.uuid == CCCD_UUID && commandNotificationWriteInProgress) {
-                    commandNotificationWriteInProgress = false
-                    runOnUiThread {
-                        enableNextCommandNotification(g)
-                    }
-                    return
-                }
-
-                runOnUiThread {
-
-                    addSection(
-                        "DESCRIPTOR WRITE",
-                        """
-                        Descriptor: ${d.uuid}
-                        Status: $statusCode
-                        """.trimIndent()
-                    )
-                }
-            }
-        }
-
-    // ---------------------------------------------------------
-    // GATT DATABASE
-    // ---------------------------------------------------------
-
-    private fun renderGatt(
-        g: BluetoothGatt,
-        statusCode: Int
-    ) {
-
-        val services =
-            try {
-                g.services
-            } catch (_: Exception) {
-                emptyList<BluetoothGattService>()
-            }
-
-        // Do not dump the whole GATT database. Build a focused command-capture screen.
-        results.removeAllViews()
-        commandCount = 0
-        lastReportByUuid.clear()
-        commandCharacteristics.clear()
-        commandLog.clear()
-
-        addSection(
-            "COMMAND CAPTURE",
-            """
-            Device: ${safeName(g.device)}
-            Address: ${safeAddress(g.device)}
-            Status: ${if (statusCode == BluetoothGatt.GATT_SUCCESS) "READY" else "DISCOVERY ERROR $statusCode"}
-
-            Press a physical button on the original Bluetooth device.
-            The exact bytes received from the device will appear below.
-
-            Capture: ${if (commandCaptureEnabled) "ON" else "PAUSED"}
-            """.trimIndent()
-        )
-
-        val controls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-
-        val clear = button("Clear")
-        val pause = button(if (commandCaptureEnabled) "Pause" else "Resume")
-        val info = button("What is this?")
-
-        clear.setOnClickListener {
-            commandCount = 0
-            lastReportByUuid.clear()
-            commandLog.clear()
-            results.removeAllViews()
-            addSection(
-                "COMMAND CAPTURE",
-                """
-                Device: ${safeName(g.device)}
-                Address: ${safeAddress(g.device)}
-                Capture: ${if (commandCaptureEnabled) "ON" else "PAUSED"}
-
-                Press a physical button on the original device.
-                """.trimIndent()
-            )
-        }
-
-        pause.setOnClickListener {
-            commandCaptureEnabled = !commandCaptureEnabled
-            pause.text = if (commandCaptureEnabled) "Pause" else "Resume"
-            status.text = if (commandCaptureEnabled) {
-                "Command capture resumed"
-            } else {
-                "Command capture paused"
-            }
-        }
-
-        info.setOnClickListener {
-            AlertDialog.Builder(this)
-                .setTitle("Command Capture")
-                .setMessage(
-                    "This screen listens only to notification/indication traffic that can carry device commands or HID input reports.\n\n" +
-                        "The HEX value is the exact payload received from the Bluetooth device. " +
-                        "It is not modified or converted before display.\n\n" +
-                        "For programming the replacement app, record the UUID + HEX for each physical button."
-                )
-                .setPositiveButton("OK", null)
-                .show()
-        }
-
-        controls.addView(clear, weightLp())
-        controls.addView(pause, weightLp())
-        controls.addView(info, weightLp())
-
-        results.addView(controls, lp(-1, -2))
-
-        val candidates = mutableListOf<BluetoothGattCharacteristic>()
-
-        services.forEach { service ->
-            val serviceUuid = service.uuid
-            val isHid = serviceUuid == HID_SERVICE_UUID
-
-            service.characteristics.forEach { c ->
-                val notify =
-                    c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
-                val indicate =
-                    c.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
-
-                // STRICT BUTTON-CAPTURE MODE:
-                // Do NOT subscribe to proprietary/custom notification streams here.
-                // Your device exposes a custom NOTIFY characteristic (for example 00001002),
-                // but that channel produces continuous traffic and is not reliable evidence
-                // of a physical button press. The standard HID Input Report is the channel
-                // we want for button events.
-                val candidate =
-                    isHid &&
-                        c.uuid == HID_INPUT_REPORT_UUID &&
-                        (notify || indicate)
-
-                if (candidate) {
-                    candidates += c
-                    commandCharacteristics += c.uuid
-                }
-            }
-        }
-
-        if (candidates.isEmpty()) {
-            addSection(
-                "NO COMMAND CHANNEL",
-                """
-                No HID Input Report notification/indication was found.
-
-                This capture mode intentionally ignores custom NOTIFY streams because they can
-                contain continuous device telemetry rather than physical button events.
-                """.trimIndent()
-            )
-            status.text = "Connected • waiting for HID button reports"
-            return
-        }
-
-        addSection(
-            "LISTENING FOR PHYSICAL BUTTONS",
-            candidates.joinToString("\n") {
-                "HID Input Report • ${it.uuid} • ${properties(it.properties)}"
-            }
-        )
-
-        // Subscribe automatically. GATT descriptor writes must be serialized, otherwise
-        // Android may return BUSY and one of the command channels can be missed.
-        pendingCommandNotifications.clear()
-        commandNotificationWriteInProgress = false
-
-        candidates.forEach { c ->
-            val indication =
-                c.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0 &&
-                    c.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0
-
-            pendingCommandNotifications.add(c to indication)
-        }
-
-        enableNextCommandNotification(g)
-
-        // HID Report Map is useful for interpreting the raw HID report later, but it is
-        // not a command stream, so it is intentionally not displayed as a result.
-        status.text =
-            "READY • waiting for a physical button press"
-    }
-
-    private fun renderGattService(
-        g: BluetoothGatt,
-        service: BluetoothGattService
-    ) {
-
-        val card =
-            createSection(
-                "SERVICE • ${service.uuid}"
-            )
-
-        addText(
-            card,
-            """
-            Name: ${gattUuidName(service.uuid)}
-            Type: ${
-                if (
-                    service.type ==
-                    BluetoothGattService.SERVICE_TYPE_PRIMARY
-                ) {
-                    "PRIMARY"
-                } else {
-                    "SECONDARY"
-                }
-            }
-            Instance ID: ${service.instanceId}
-            Characteristics: ${service.characteristics.size}
-            """.trimIndent()
-        )
-
-        service.characteristics.forEach { characteristic ->
-
-            renderCharacteristic(
-                g,
-                card,
-                characteristic
-            )
-        }
-    }
-
-    private fun renderCharacteristic(
-        g: BluetoothGatt,
-        parent: LinearLayout,
-        characteristic: BluetoothGattCharacteristic
-    ) {
-
-        val box =
-            LinearLayout(this).apply {
-
-                orientation =
-                    LinearLayout.VERTICAL
-
-                setPadding(
-                    dp(10),
-                    dp(10),
-                    dp(10),
-                    dp(10)
-                )
-
-                setBackgroundColor(
-                    getColor(R.color.bg)
-                )
-            }
-
-        addText(
-            box,
-            """
-            CHARACTERISTIC
-            UUID: ${characteristic.uuid}
-            Name: ${gattUuidName(characteristic.uuid)}
-            Properties: ${properties(characteristic.properties)}
-            Permissions: ${characteristicPermissions(characteristic.permissions)}
-            Write Type: ${writeTypeName(characteristic.writeType)}
-            Descriptors: ${characteristic.descriptors.size}
-            """.trimIndent()
-        )
-
-        characteristic.descriptors.forEach { descriptor ->
-
-            addText(
-                box,
-                """
-                DESCRIPTOR
-                UUID: ${descriptor.uuid}
-                Name: ${gattUuidName(descriptor.uuid)}
-                Permissions: ${descriptorPermissions(descriptor.permissions)}
-                """.trimIndent()
-            )
-        }
-
-        val controls =
-            LinearLayout(this).apply {
-                orientation =
-                    LinearLayout.HORIZONTAL
-            }
-
-        if (
-            characteristic.properties and
-            BluetoothGattCharacteristic.PROPERTY_READ != 0
-        ) {
-
-            val read =
-                button("Read")
-
-            read.setOnClickListener {
-
-                try {
-
-                    if (Build.VERSION.SDK_INT >= 33) {
-
-                        g.readCharacteristic(
-                            characteristic
-                        )
-
-                    } else {
-
-                        @Suppress("DEPRECATION")
-                        g.readCharacteristic(
-                            characteristic
-                        )
-                    }
-
-                } catch (e: Exception) {
-
-                    status.text =
-                        "Read error: ${e.message}"
-                }
-            }
-
-            controls.addView(
-                read,
-                weightLp()
-            )
-        }
-
-        if (
-            characteristic.properties and
-            (
-                BluetoothGattCharacteristic.PROPERTY_WRITE or
-                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
-                ) != 0
-        ) {
-
-            val write =
-                button("Write")
-
-            write.setOnClickListener {
-
-                showWriteDialog(
-                    g,
-                    characteristic
-                )
-            }
-
-            controls.addView(
-                write,
-                weightLp()
-            )
-        }
-
-        if (
-            characteristic.properties and
-            BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
-        ) {
-
-            val notify =
-                button("Notify ON")
-
-            notify.setOnClickListener {
-
-                enableNotification(
-                    g,
-                    characteristic,
-                    false
-                )
-            }
-
-            controls.addView(
-                notify,
-                weightLp()
-            )
-        }
-
-        if (
-            characteristic.properties and
-            BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
-        ) {
-
-            val indicate =
-                button("Indicate ON")
-
-            indicate.setOnClickListener {
-
-                enableNotification(
-                    g,
-                    characteristic,
-                    true
-                )
-            }
-
-            controls.addView(
-                indicate,
-                weightLp()
-            )
-        }
-
-        if (
-            characteristic.descriptors.isNotEmpty()
-        ) {
-
-            val descriptorButton =
-                button("Descriptors")
-
-            descriptorButton.setOnClickListener {
-
-                showDescriptorDialog(
-                    g,
-                    characteristic
-                )
-            }
-
-            controls.addView(
-                descriptorButton,
-                weightLp()
-            )
-        }
-
-        if (controls.childCount > 0) {
-
-            box.addView(
-                controls,
-                lp(-1, -2)
-            )
-        }
-
-        parent.addView(
-            box,
-            lp(-1, -2)
-        )
-    }
-
-    // ---------------------------------------------------------
-    // NOTIFICATION / INDICATION
-    // ---------------------------------------------------------
-
-    private fun enableNextCommandNotification(
-        g: BluetoothGatt
-    ) {
-
-        if (commandNotificationWriteInProgress) return
-
-        if (pendingCommandNotifications.isEmpty()) {
-            commandNotificationWriteInProgress = false
-            status.text =
-                "READY • press a button on ${safeName(g.device)}"
-            return
-        }
-
-        val next = pendingCommandNotifications.removeAt(0)
-        commandNotificationWriteInProgress = true
-
-        val (characteristic, indication) = next
-
-        if (!hasConnectPermission()) {
-            commandNotificationWriteInProgress = false
-            requestBluetoothPermissions()
-            return
-        }
-
-        try {
-            if (!g.setCharacteristicNotification(characteristic, true)) {
-                commandNotificationWriteInProgress = false
-                handler.post { enableNextCommandNotification(g) }
-                return
-            }
-
-            val cccd = characteristic.descriptors.firstOrNull {
-                it.uuid == CCCD_UUID
-            }
-
-            if (cccd == null) {
-                commandNotificationWriteInProgress = false
-                handler.post { enableNextCommandNotification(g) }
-                return
-            }
-
-            val value =
-                if (indication) {
-                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                } else {
-                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                }
-
-            if (Build.VERSION.SDK_INT >= 33) {
-                val result = g.writeDescriptor(cccd, value)
-                if (result != BluetoothStatusCodes.SUCCESS) {
-                    commandNotificationWriteInProgress = false
-                    handler.post { enableNextCommandNotification(g) }
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                cccd.value = value
-
-                @Suppress("DEPRECATION")
-                val started = g.writeDescriptor(cccd)
-
-                if (!started) {
-                    commandNotificationWriteInProgress = false
-                    handler.post { enableNextCommandNotification(g) }
-                }
-            }
-
-        } catch (_: Exception) {
-            commandNotificationWriteInProgress = false
-            handler.post { enableNextCommandNotification(g) }
-        }
-    }
-
-    private fun enableNotification(
-        g: BluetoothGatt,
-        characteristic: BluetoothGattCharacteristic,
-        indication: Boolean,
-        silent: Boolean = false
-    ) {
-
-        if (!hasConnectPermission()) {
-
-            requestBluetoothPermissions()
-
-            return
-        }
-
-        try {
-
-            val local =
-                g.setCharacteristicNotification(
-                    characteristic,
-                    true
-                )
-
-            if (!local) {
-
-                if (!silent) {
-                    status.text = "Local notification registration failed"
-                }
-
-                return
-            }
-
-            val cccd =
-                characteristic.descriptors.firstOrNull {
-                    it.uuid == CCCD_UUID
-                }
-
-            if (cccd == null) {
-
-                if (!silent) {
-                    status.text = "Notification channel unavailable • ${characteristic.uuid}"
-                }
-
-                return
-            }
-
-            val value =
-                if (indication) {
-
-                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-
-                } else {
-
-                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                }
-
-            val started =
-                if (Build.VERSION.SDK_INT >= 33) {
-
-                    g.writeDescriptor(
-                        cccd,
-                        value
-                    ) == BluetoothStatusCodes.SUCCESS
-
-                } else {
-
-                    @Suppress("DEPRECATION")
-                    cccd.value = value
-
-                    @Suppress("DEPRECATION")
-                    g.writeDescriptor(cccd)
-                }
-
-            if (!silent) {
-                status.text =
-                    if (started) {
-                        if (indication) {
-                            "Indication enabling requested"
-                        } else {
-                            "Notification enabling requested"
-                        }
-                    } else {
-                        "CCCD write failed to start"
-                    }
-            }
-
-        } catch (e: SecurityException) {
-
-            if (!silent) {
-                status.text = "Bluetooth permission denied"
-            }
-
-        } catch (e: Exception) {
-
-            if (!silent) {
-                status.text = "Notification error: ${e.message}"
-            }
-        }
-    }
-
-    // ---------------------------------------------------------
-    // WRITE
-    // ---------------------------------------------------------
-
-    private fun showWriteDialog(
-        g: BluetoothGatt,
-        characteristic: BluetoothGattCharacteristic
-    ) {
-
-        val input =
-            EditText(this).apply {
-
-                hint =
-                    "HEX: 01 FF 00"
-
-                setSingleLine(true)
-            }
-
-        AlertDialog.Builder(this)
-            .setTitle("Write Characteristic")
-            .setMessage(
-                "${characteristic.uuid}\n\n" +
-                    "Properties: ${
-                        properties(
-                            characteristic.properties
-                        )
-                    }"
-            )
-            .setView(input)
-            .setNegativeButton(
-                "Cancel",
-                null
-            )
-            .setPositiveButton(
-                "Write"
-            ) { _, _ ->
-
-                val bytes =
-                    parseHex(
-                        input.text.toString()
-                    )
-
-                if (bytes.isEmpty()) {
-
-                    status.text =
-                        "No valid HEX bytes"
-
-                    return@setPositiveButton
-                }
-
-                try {
-
-                    val writeType =
-                        if (
-                            characteristic.properties and
-                            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
-                        ) {
-
-                            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-
-                        } else {
-
-                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                        }
-
-                    if (Build.VERSION.SDK_INT >= 33) {
-
-                        val result =
-                            g.writeCharacteristic(
-                                characteristic,
-                                bytes,
-                                writeType
-                            )
-
-                        status.text =
-                            "Write requested • result=$result"
-
-                    } else {
-
-                        @Suppress("DEPRECATION")
-                        characteristic.writeType =
-                            writeType
-
-                        @Suppress("DEPRECATION")
-                        characteristic.value =
-                            bytes
-
-                        @Suppress("DEPRECATION")
-                        val ok =
-                            g.writeCharacteristic(
-                                characteristic
-                            )
-
-                        status.text =
-                            "Write requested • $ok"
-                    }
-
-                } catch (e: Exception) {
-
-                    status.text =
-                        "Write error: ${e.message}"
-                }
-            }
-            .show()
-    }
-
-    // ---------------------------------------------------------
-    // DESCRIPTORS
-    // ---------------------------------------------------------
-
-    private fun showDescriptorDialog(
-        g: BluetoothGatt,
-        characteristic: BluetoothGattCharacteristic
-    ) {
-
-        val names =
-            characteristic.descriptors
-                .map {
-                    "${it.uuid}"
-                }
-                .toTypedArray()
-
-        if (names.isEmpty()) return
-
-        AlertDialog.Builder(this)
-            .setTitle(
-                "Descriptors"
-            )
-            .setItems(names) { _, which ->
-
-                readDescriptor(
-                    g,
-                    characteristic.descriptors[which]
-                )
-            }
-            .setNegativeButton(
-                "Close",
-                null
-            )
-            .show()
-    }
-
-    private fun readDescriptor(
-        g: BluetoothGatt,
-        descriptor: BluetoothGattDescriptor
-    ) {
-
-        try {
-
-            if (Build.VERSION.SDK_INT >= 33) {
-
-                val result =
-                    g.readDescriptor(
-                        descriptor
-                    )
-
-                status.text =
-                    "Descriptor read requested • result=$result"
-
-            } else {
-
-                @Suppress("DEPRECATION")
-                val result =
-                    g.readDescriptor(
-                        descriptor
-                    )
-
-                status.text =
-                    "Descriptor read requested • $result"
-            }
-
-        } catch (e: Exception) {
-
-            status.text =
-                "Descriptor read error: ${e.message}"
-        }
-    }
-
-    // ---------------------------------------------------------
-    // GATT DATA
-    // ---------------------------------------------------------
-
-    private fun renderGattData(
-        title: String,
-        uuid: UUID,
-        value: ByteArray,
-        statusCode: Int
-    ) {
-
-        addSection(
-            title,
-            """
-            UUID: $uuid
-            Status: $statusCode
-
-            HEX:
-            ${hex(value)}
-
-            TEXT:
-            ${printable(value)}
-            """.trimIndent()
-        )
-    }
-
-    private fun renderNotification(
-        characteristic: BluetoothGattCharacteristic,
-        value: ByteArray
-    ) {
-
-        if (!commandCaptureEnabled) return
-
-        // Absolute filter: only the standard HID Input Report can reach the
-        // button log. Custom notification streams are intentionally ignored.
-        if (characteristic.uuid != HID_INPUT_REPORT_UUID) return
-        if (characteristic.uuid !in commandCharacteristics) return
-
-        val previous = lastReportByUuid[characteristic.uuid]
-
-        // Many HID devices repeat the current state periodically. A repeated
-        // identical report is not a new button event, so suppress it.
-        if (previous != null && previous.contentEquals(value)) return
-
-        val changed = changedBytes(previous, value)
-        lastReportByUuid[characteristic.uuid] = value.copyOf()
-        commandCount++
-
-        val label =
-            if (characteristic.uuid == HID_INPUT_REPORT_UUID) {
-                "HID BUTTON REPORT"
-            } else {
-                "DEVICE COMMAND"
-            }
-
-        val body = buildString {
-            append("Event #$commandCount\n")
-            append("Channel: $label\n")
-            append("UUID: ${characteristic.uuid}\n")
-            append("Length: ${value.size} bytes\n")
-            append("\nEXACT RAW HEX:\n")
-            append(hex(value))
-            append("\n\nChanged bytes:")
-            append(
-                if (changed.isEmpty()) {
-                    " none"
-                } else {
-                    " " + changed.joinToString(", ") { it.toString() }
-                }
-            )
-
-            if (characteristic.uuid == HID_INPUT_REPORT_UUID) {
-                append("\n\nHID interpretation: ${decodeHidReport(value)}")
-            }
-
-            append("\n\nTEXT (diagnostic only):\n")
-            append(printable(value))
-        }
-
-        val card = createSection(
-            "#$commandCount • ${if (characteristic.uuid == HID_INPUT_REPORT_UUID) "BUTTON" else "COMMAND"}"
-        )
-
-        addText(card, body)
-
-        // Newest command first: move the card to the top of the result list.
-        results.removeView(card)
-        results.addView(card, 2.coerceAtMost(results.childCount))
-
-        status.text =
-            "CAPTURED #$commandCount • ${hex(value)}"
-    }
-
-    private fun changedBytes(
-        previous: ByteArray?,
-        current: ByteArray
-    ): List<Int> {
-
-        if (previous == null) {
-            return current.indices.toList()
-        }
-
-        val max = maxOf(previous.size, current.size)
-        val changed = mutableListOf<Int>()
-
-        for (i in 0 until max) {
-            val old = if (i < previous.size) previous[i].toInt() and 0xFF else -1
-            val now = if (i < current.size) current[i].toInt() and 0xFF else -1
-            if (old != now) changed += i
-        }
-
-        return changed
-    }
-
-    private fun decodeHidReport(
-        value: ByteArray
     ): String {
-
-        if (value.isEmpty()) return "empty report"
-
-        // Do not pretend to know a proprietary mapping. For standard HID reports,
-        // expose useful byte values while keeping the exact raw report above.
-        val bytes = value.map { it.toInt() and 0xFF }
-
-        return buildString {
-            append("bytes=")
-            append(bytes.joinToString(" "))
-
-            if (bytes.size >= 2) {
-                append("; non-zero positions=")
-                append(
-                    bytes.mapIndexedNotNull { index, b ->
-                        if (b != 0) "$index:$b" else null
-                    }.joinToString(", ").ifEmpty { "none" }
-                )
-            }
+        return try {
+            device.name
+                ?.takeIf { it.isNotBlank() }
+                ?: "جهاز Bluetooth"
+        } catch (_: SecurityException) {
+            "جهاز Bluetooth"
         }
     }
 
-    private fun isCustomService(
-        uuid: UUID
-    ): Boolean {
-
-        return uuid.toString().lowercase().let {
-            it != "00001800-0000-1000-8000-00805f9b34fb" &&
-                it != "00001801-0000-1000-8000-00805f9b34fb" &&
-                it != "0000180a-0000-1000-8000-00805f9b34fb" &&
-                it != "0000180f-0000-1000-8000-00805f9b34fb" &&
-                it != "00001812-0000-1000-8000-00805f9b34fb"
-        }
-    }
-
-    // ---------------------------------------------------------
-    // UUID NAMES
-    // ---------------------------------------------------------
-
-    private fun gattUuidName(
-        uuid: UUID
-    ): String {
-
-        return when (
-            uuid.toString().lowercase()
-        ) {
-
-            "00001800-0000-1000-8000-00805f9b34fb" ->
-                "Generic Access"
-
-            "00001801-0000-1000-8000-00805f9b34fb" ->
-                "Generic Attribute"
-
-            "0000180a-0000-1000-8000-00805f9b34fb" ->
-                "Device Information Service"
-
-            "0000180f-0000-1000-8000-00805f9b34fb" ->
-                "Battery Service"
-
-            "0000180d-0000-1000-8000-00805f9b34fb" ->
-                "Heart Rate Service"
-
-            "00001812-0000-1000-8000-00805f9b34fb" ->
-                "Human Interface Device"
-
-            "0000180e-0000-1000-8000-00805f9b34fb" ->
-                "Phone Alert Status"
-
-            "00001809-0000-1000-8000-00805f9b34fb" ->
-                "Health Thermometer"
-
-            "00002a00-0000-1000-8000-00805f9b34fb" ->
-                "Device Name"
-
-            "00002a01-0000-1000-8000-00805f9b34fb" ->
-                "Appearance"
-
-            "00002a19-0000-1000-8000-00805f9b34fb" ->
-                "Battery Level"
-
-            "00002a29-0000-1000-8000-00805f9b34fb" ->
-                "Manufacturer Name String"
-
-            "00002a24-0000-1000-8000-00805f9b34fb" ->
-                "Model Number String"
-
-            "00002a25-0000-1000-8000-00805f9b34fb" ->
-                "Serial Number String"
-
-            "00002a26-0000-1000-8000-00805f9b34fb" ->
-                "Firmware Revision String"
-
-            "00002a27-0000-1000-8000-00805f9b34fb" ->
-                "Hardware Revision String"
-
-            "00002a28-0000-1000-8000-00805f9b34fb" ->
-                "Software Revision String"
-
-            "00002a4b-0000-1000-8000-00805f9b34fb" ->
-                "HID Report Map"
-
-            "00002a4d-0000-1000-8000-00805f9b34fb" ->
-                "HID Input Report"
-
-            CCCD_UUID.toString().lowercase() ->
-                "Client Characteristic Configuration"
-
-            else ->
-                "Unknown / Custom UUID"
-        }
-    }
-
-    // ---------------------------------------------------------
-    // CHARACTERISTIC HELPERS
-    // ---------------------------------------------------------
-
-    private fun properties(
-        p: Int
-    ): String {
-
-        val list =
-            mutableListOf<String>()
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_BROADCAST != 0
-        ) {
-            list += "BROADCAST"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_READ != 0
-        ) {
-            list += "READ"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_WRITE != 0
-        ) {
-            list += "WRITE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
-        ) {
-            list += "WRITE_NO_RESPONSE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
-        ) {
-            list += "NOTIFY"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
-        ) {
-            list += "INDICATE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_SIGNED_WRITE != 0
-        ) {
-            list += "SIGNED_WRITE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_EXTENDED_PROPS != 0
-        ) {
-            list += "EXTENDED"
-        }
-
-        return list.joinToString(", ")
-            .ifEmpty {
-                "NONE"
-            }
-    }
-
-    private fun characteristicPermissions(
-        p: Int
-    ): String {
-
-        val list =
-            mutableListOf<String>()
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_READ != 0
-        ) {
-            list += "READ"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_WRITE != 0
-        ) {
-            list += "WRITE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED != 0
-        ) {
-            list += "READ_ENCRYPTED"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED != 0
-        ) {
-            list += "WRITE_ENCRYPTED"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED_MITM != 0
-        ) {
-            list += "READ_MITM"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED_MITM != 0
-        ) {
-            list += "WRITE_MITM"
-        }
-
-        return list.joinToString(", ")
-            .ifEmpty {
-                "NONE"
-            }
-    }
-
-    private fun descriptorPermissions(
-        p: Int
-    ): String {
-
-        val list =
-            mutableListOf<String>()
-
-        if (
-            p and
-            BluetoothGattDescriptor.PERMISSION_READ != 0
-        ) {
-            list += "READ"
-        }
-
-        if (
-            p and
-            BluetoothGattDescriptor.PERMISSION_WRITE != 0
-        ) {
-            list += "WRITE"
-        }
-
-        if (
-            p and
-            BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED != 0
-        ) {
-            list += "READ_ENCRYPTED"
-        }
-
-        if (
-            p and
-            BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED != 0
-        ) {
-            list += "WRITE_ENCRYPTED"
-        }
-
-        if (
-            p and
-            BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED_MITM != 0
-        ) {
-            list += "READ_MITM"
-        }
-
-        if (
-            p and
-            BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED_MITM != 0
-        ) {
-            list += "WRITE_MITM"
-        }
-
-        return list.joinToString(", ")
-            .ifEmpty {
-                "NONE"
-            }
-    }
-
-    private fun writeTypeName(
-        type: Int
-    ): String {
-
-        return when (type) {
-
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT ->
-                "WRITE"
-
-            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE ->
-                "WRITE_NO_RESPONSE"
-
-            BluetoothGattCharacteristic.WRITE_TYPE_SIGNED ->
-                "SIGNED_WRITE"
-
-            else ->
-                type.toString()
-        }
-    }
-
-    // ---------------------------------------------------------
-    // GENERAL HELPERS
-    // ---------------------------------------------------------
-
-    private fun addSection(
-        title: String,
-        body: String
-    ) {
-
-        val card =
-            createSection(title)
-
-        if (body.isNotBlank()) {
-            addText(card, body)
-        }
-    }
-
-    private fun createSection(
-        title: String
-    ): LinearLayout {
-
-        val card =
-            findOrCreateSection(title)
-
-        card.removeAllViews()
-
-        addHeader(
-            card,
-            title,
-            ""
-        )
-
-        return card
-    }
-
-    private fun findOrCreateSection(
-        title: String
-    ): LinearLayout {
-
-        for (
-            i in 0 until results.childCount
-        ) {
-
-            val child =
-                results.getChildAt(i)
-
-            if (
-                child is LinearLayout &&
-                child.tag == title
-            ) {
-                return child
-            }
-        }
-
-        return LinearLayout(this).apply {
-
-            tag = title
-
-            orientation =
-                LinearLayout.VERTICAL
-
-            setPadding(
-                dp(14),
-                dp(12),
-                dp(14),
-                dp(12)
-            )
-
-            setBackgroundColor(
-                getColor(R.color.panel)
-            )
-
-            results.addView(
-                this,
-                lp(-1, -2)
-            )
-        }
-    }
-
-    private fun addHeader(
-        parent: LinearLayout,
-        title: String,
-        trailing: String
-    ) {
-
-        val row =
-            LinearLayout(this).apply {
-                orientation =
-                    LinearLayout.HORIZONTAL
-            }
-
-        val text =
-            TextView(this).apply {
-
-                this.text =
-                    title
-
-                textSize = 16f
-
+    private fun text(
+        value: String,
+        size: Float,
+        bold: Boolean
+    ): TextView {
+        return TextView(this).apply {
+            text = value
+            textSize = size
+            setTextColor(0xFFE8EDF3.toInt())
+
+            if (bold) {
                 typeface =
                     android.graphics.Typeface.DEFAULT_BOLD
-
-                setTextColor(
-                    getColor(R.color.text)
-                )
             }
-
-        row.addView(
-            text,
-            LinearLayout.LayoutParams(
-                0,
-                -2,
-                1f
-            )
-        )
-
-        if (trailing.isNotEmpty()) {
-
-            val tail =
-                TextView(this).apply {
-
-                    this.text =
-                        trailing
-
-                    textSize = 12f
-
-                    setTextColor(
-                        getColor(R.color.muted)
-                    )
-                }
-
-            row.addView(
-                tail
-            )
-        }
-
-        parent.addView(
-            row
-        )
-    }
-
-    private fun addText(
-        parent: LinearLayout,
-        text: String
-    ) {
-
-        val view =
-            TextView(this).apply {
-
-                this.text =
-                    text
-
-                textSize = 13f
-
-                setTextColor(
-                    getColor(R.color.text)
-                )
-
-                setPadding(
-                    0,
-                    dp(8),
-                    0,
-                    0
-                )
-
-                typeface =
-                    android.graphics.Typeface.MONOSPACE
-            }
-
-        parent.addView(
-            view
-        )
-    }
-
-    private fun button(
-        label: String
-    ): Button {
-
-        return Button(this).apply {
-
-            text =
-                label
-
-            textSize = 11f
-
-            isAllCaps = false
-
-            minHeight =
-                dp(42)
-
-            setPadding(
-                dp(4),
-                0,
-                dp(4),
-                0
-            )
         }
     }
 
     private fun lp(
         width: Int,
         height: Int
-    ) =
-        LinearLayout.LayoutParams(
+    ): LinearLayout.LayoutParams {
+        return LinearLayout.LayoutParams(
+            width,
+            height
+        )
+    }
+
+    private fun marginLp(
+        width: Int,
+        height: Int,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int
+    ): LinearLayout.LayoutParams {
+        return LinearLayout.LayoutParams(
             width,
             height
         ).apply {
-
             setMargins(
-                0,
-                dp(5),
-                0,
-                dp(5)
+                dp(left),
+                dp(top),
+                dp(right),
+                dp(bottom)
             )
         }
+    }
 
-    private fun weightLp() =
-        LinearLayout.LayoutParams(
-            0,
-            dp(48),
-            1f
-        ).apply {
-
-            setMargins(
-                dp(2),
-                dp(5),
-                dp(2),
-                dp(5)
-            )
-        }
-
-    private fun dp(
-        value: Int
-    ): Int =
-        (
+    private fun dp(value: Int): Int {
+        return (
             value *
                 resources.displayMetrics.density
-            ).roundToInt()
-
-    // ---------------------------------------------------------
-    // BLUETOOTH HELPERS
-    // ---------------------------------------------------------
-
-    private fun safeName(
-        device: BluetoothDevice
-    ): String {
-
-        return try {
-            device.name ?: "(unknown)"
-        } catch (_: SecurityException) {
-            "(permission)"
-        }
-    }
-
-    private fun safeAddress(
-        device: BluetoothDevice
-    ): String {
-
-        return try {
-            device.address
-        } catch (_: SecurityException) {
-            "(permission)"
-        }
-    }
-
-    private fun tryName(
-        a: BluetoothAdapter
-    ): String {
-
-        return try {
-            a.name ?: "(unknown)"
-        } catch (_: SecurityException) {
-            "(permission)"
-        }
-    }
-
-    private fun tryAddress(
-        a: BluetoothAdapter
-    ): String {
-
-        return try {
-            a.address
-        } catch (_: SecurityException) {
-            "(restricted)"
-        }
-    }
-
-    private fun tryState(
-        a: BluetoothAdapter
-    ): String {
-
-        return try {
-            a.state.toString()
-        } catch (_: SecurityException) {
-            "unknown"
-        }
-    }
-
-    private fun bondName(
-        state: Int
-    ): String {
-
-        return when (state) {
-
-            BluetoothDevice.BOND_BONDED ->
-                "BONDED"
-
-            BluetoothDevice.BOND_BONDING ->
-                "BONDING"
-
-            BluetoothDevice.BOND_NONE ->
-                "NONE"
-
-            else ->
-                state.toString()
-        }
-    }
-
-    private fun typeName(
-        type: Int
-    ): String {
-
-        return when (type) {
-
-            BluetoothDevice.DEVICE_TYPE_CLASSIC ->
-                "CLASSIC"
-
-            BluetoothDevice.DEVICE_TYPE_LE ->
-                "BLE"
-
-            BluetoothDevice.DEVICE_TYPE_DUAL ->
-                "DUAL"
-
-            else ->
-                "UNKNOWN"
-        }
-    }
-
-    // ---------------------------------------------------------
-    // DATA FORMATTERS
-    // ---------------------------------------------------------
-
-    private fun formatManufacturer(
-        sparse: android.util.SparseArray<ByteArray>?
-    ): String {
-
-        if (
-            sparse == null ||
-            sparse.size() == 0
-        ) {
-            return "none"
-        }
-
-        return buildString {
-
-            for (
-                i in 0 until sparse.size()
-            ) {
-
-                append(
-                    "Company ID=${sparse.keyAt(i)}: "
-                )
-
-                append(
-                    hex(
-                        sparse.valueAt(i)
-                    )
-                )
-
-                append("\n")
-            }
-        }.trim()
-    }
-
-    private fun formatMap(
-        map: Map<ParcelUuid, ByteArray>?
-    ): String {
-
-        if (map.isNullOrEmpty()) {
-            return "none"
-        }
-
-        return map.entries.joinToString("\n") {
-
-            "${it.key}: ${hex(it.value)}"
-        }
-    }
-
-    private fun hex(
-        bytes: ByteArray?
-    ): String {
-
-        return bytes?.joinToString(" ") {
-
-            "%02X".format(
-                it.toInt() and 0xFF
-            )
-
-        } ?: "null"
-    }
-
-    private fun printable(
-        bytes: ByteArray?
-    ): String {
-
-        return try {
-
-            bytes
-                ?.toString(
-                    Charset.forName("UTF-8")
-                )
-                ?.replace(
-                    Regex("[^\\x20-\\x7E]"),
-                    "."
-                )
-                ?: ""
-
-        } catch (_: Exception) {
-
-            ""
-        }
-    }
-
-    private fun parseHex(
-        input: String
-    ): ByteArray {
-
-        val cleaned =
-            input
-                .trim()
-                .replace(
-                    Regex("[,:-]"),
-                    " "
-                )
-
-        if (cleaned.isBlank()) {
-            return ByteArray(0)
-        }
-
-        return cleaned
-            .split(
-                Regex("\\s+")
-            )
-            .filter {
-                it.matches(
-                    Regex("[0-9A-Fa-f]{1,2}")
-                )
-            }
-            .map {
-                it.toInt(16).toByte()
-            }
-            .toByteArray()
-    }
-
-    // ---------------------------------------------------------
-    // PERMISSIONS
-    // ---------------------------------------------------------
-
-    private fun hasScanPermission(): Boolean {
-
-        return if (Build.VERSION.SDK_INT >= 31) {
-
-            checkSelfPermission(
-                Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
-
-        } else {
-
-            true
-        }
-    }
-
-    private fun hasConnectPermission(): Boolean {
-
-        return if (Build.VERSION.SDK_INT >= 31) {
-
-            checkSelfPermission(
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
-
-        } else {
-
-            true
-        }
-    }
-
-    private fun requestBluetoothPermissions() {
-
-        if (Build.VERSION.SDK_INT >= 31) {
-
-            requestPermissions(
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_CONNECT
-                ),
-                permissionRequest
-            )
-
-        } else if (Build.VERSION.SDK_INT >= 23) {
-
-            requestPermissions(
-                arrayOf(
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ),
-                permissionRequest
-            )
-        }
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-
-        super.onRequestPermissionsResult(
-            requestCode,
-            permissions,
-            grantResults
-        )
-
-        if (
-            requestCode ==
-            permissionRequest
-        ) {
-
-            refreshLocalInfo()
-        }
-    }
-
-    // ---------------------------------------------------------
-    // PARCELABLE COMPATIBILITY
-    // ---------------------------------------------------------
-
-    private inline fun <reified T : Parcelable>
-            Intent.getParcelableExtraCompat(
-        key: String
-    ): T? {
-
-        return if (
-            Build.VERSION.SDK_INT >= 33
-        ) {
-
-            getParcelableExtra(
-                key,
-                T::class.java
-            )
-
-        } else {
-
-            @Suppress("DEPRECATION")
-            getParcelableExtra(
-                key
-            )
-        }
+            ).toInt()
     }
 }
