@@ -23,6 +23,7 @@ import android.view.KeyEvent
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.util.Locale
 import java.util.UUID
 
 class MainActivity : Activity(), InputManager.InputDeviceListener {
@@ -171,15 +172,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             enableNotifications(g, target)
         }
 
-        override fun onCharacteristicChanged(
-            g: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray
-        ) {
-            handleGattPacket(characteristic, value)
-        }
-
-        @Deprecated("Deprecated in Android 13")
+        @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(
             g: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
@@ -364,21 +357,8 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             .replace("-", "")
             .replace("_", "")
             .replace(" ", "")
-            .lowercase()
+            .toLowerCase(Locale.US)
 
-    private fun isLikelyHid(device: BluetoothDevice): Boolean {
-        if (Build.VERSION.SDK_INT < 33) return false
-
-        return try {
-            device.bluetoothClass?.hasService(
-                android.bluetooth.BluetoothClass.Service.RENDER
-            ) == false &&
-                device.bluetoothClass?.majorDeviceClass ==
-                android.bluetooth.BluetoothClass.Device.Major.PERIPHERAL
-        } catch (_: Exception) {
-            false
-        }
-    }
 
     private fun connectGattToGlaze4(device: BluetoothDevice) {
         if (!hasConnectPermission()) return
@@ -409,19 +389,11 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         }
 
         try {
-            // For Dual devices, explicitly request LE. For LE devices this is
-            // also the correct transport. Classic devices were rejected above.
-            gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                device.connectGatt(
-                    this,
-                    false,
-                    gattCallback,
-                    BluetoothDevice.TRANSPORT_LE
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                device.connectGatt(this, false, gattCallback)
-            }
+            // Use the most compatible public connectGatt overload.
+            // Classic-only devices are rejected above, so this is used only
+            // for LE/Dual devices.
+            @Suppress("DEPRECATION")
+            gatt = device.connectGatt(this, false, gattCallback)
 
             // Do not leave the UI stuck forever if the stack never calls back.
             handler.postDelayed({
