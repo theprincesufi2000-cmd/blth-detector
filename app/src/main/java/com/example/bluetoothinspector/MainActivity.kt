@@ -3,6 +3,7 @@ package com.example.bluetoothinspector
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.bluetooth.*
 import android.bluetooth.le.*
 import android.content.*
@@ -11,7 +12,6 @@ import android.os.*
 import android.view.*
 import android.widget.*
 import java.nio.charset.Charset
-import java.util.UUID
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
@@ -233,15 +233,17 @@ class MainActivity : Activity() {
     }
 
     private fun inspectSdp(device: BluetoothDevice) {
-        try {
-            device.fetchUuids(BluetoothDevice.TRANSPORT_AUTO)
-            status.text = "SDP UUID discovery requested for ${safeName(device)}"
-        } catch (e: SecurityException) {
-            status.text = "Bluetooth permission denied"
-        } catch (e: Exception) {
-            status.text = "SDP error: ${e.message}"
-        }
+    try {
+        @Suppress("DEPRECATION")
+        device.fetchUuidsWithSdp()
+
+        status.text = "SDP UUID discovery requested for ${safeName(device)}"
+    } catch (e: SecurityException) {
+        status.text = "Bluetooth permission denied"
+    } catch (e: Exception) {
+        status.text = "SDP error: ${e.message ?: "Unknown error"}"
     }
+}
 
     private fun connectGatt(device: BluetoothDevice) {
         gatt?.close()
@@ -533,7 +535,7 @@ class MainActivity : Activity() {
         if (p and BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED != 0) out += "WRITE_ENCRYPTED"
         if (p and BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED_MITM != 0) out += "READ_MITM"
         if (p and BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED_MITM != 0) out += "WRITE_MITM"
-        if (p and BluetoothGattCharacteristic.PERMISSION_SIGNED_WRITE != 0) out += "SIGNED_WRITE"
+        if (p and BluetoothGattCharacteristic.PERMISSION_WRITE_SIGNED != 0) out += "SIGNED_WRITE"
         return out.joinToString(", ").ifEmpty { "none" }
     }
 
@@ -544,10 +546,13 @@ class MainActivity : Activity() {
         }.trim()
     }
 
-    private fun formatMap(map: Map<UUID, ByteArray>?): String {
-        if (map.isNullOrEmpty()) return "none"
-        return map.entries.joinToString("\n") { "${it.key}: ${hex(it.value)}" }
+    private fun formatMap(map: Map<*, ByteArray>?): String {
+    if (map.isNullOrEmpty()) return "none"
+
+    return map.entries.joinToString("\n") {
+        "${it.key}: ${hex(it.value)}"
     }
+}
 
     private fun hex(bytes: ByteArray?): String =
         bytes?.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) } ?: "null"
