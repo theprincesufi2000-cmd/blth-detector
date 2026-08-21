@@ -357,7 +357,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             .replace("-", "")
             .replace("_", "")
             .replace(" ", "")
-            .toLowerCase(Locale.US)
+            .lowercase()
 
 
     private fun connectGattToGlaze4(device: BluetoothDevice) {
@@ -645,13 +645,19 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             val ids = InputDevice.getDeviceIds()
             if (ids.isEmpty()) return "لا توجد أجهزة إدخال ظاهرة لواجهة Android."
 
-            ids.mapNotNull { id ->
-                val d = InputDevice.getDevice(id) ?: return@mapNotNull null
-                if (!isExternalInputDevice(d)) return@mapNotNull null
+            val devices = mutableListOf<String>()
+            for (id in ids) {
+                val d = InputDevice.getDevice(id) ?: continue
+                if (!isExternalInputDevice(d)) continue
                 val sources = "0x%08X".format(d.sources)
-                "• ${d.name}\n  deviceId=$id\n  sources=$sources\n  descriptor=${d.descriptor ?: "N/A"}"
-            }.ifEmpty { "لا يوجد HID/Keyboard/Gamepad خارجي ظاهر حاليًا لواجهة Android." }
-                .joinToString("\n\n")
+                devices += "• ${d.name}\n  deviceId=$id\n  sources=$sources\n  descriptor=${d.descriptor ?: "N/A"}"
+            }
+
+            if (devices.isEmpty()) {
+                "لا يوجد HID/Keyboard/Gamepad خارجي ظاهر حاليًا لواجهة Android."
+            } else {
+                devices.joinToString("\n\n")
+            }
         } catch (e: Exception) {
             "تعذر قراءة قائمة أجهزة الإدخال: ${e.message ?: "unknown"}"
         }
