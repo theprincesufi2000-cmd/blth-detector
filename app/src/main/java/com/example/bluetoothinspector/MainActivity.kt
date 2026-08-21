@@ -258,6 +258,11 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
      * device and never perform a BLE scan.
      */
     private fun autoDetectGlaze4() {
+        // Once the user starts capture, the capture screen owns the status area.
+        // The 1-second auto detector must never overwrite it with a transient
+        // "no GATT/HID" message.
+        if (captureEnabled) return
+
         if (!hasConnectPermission()) {
             status.text = "اسمح للتطبيق بصلاحية Bluetooth"
             return
@@ -605,6 +610,42 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         return super.dispatchKeyEvent(event)
     }
 
+    override fun dispatchGenericMotionEvent(event: android.view.MotionEvent): Boolean {
+        if (captureEnabled) {
+            val source = event.source
+            val external =
+                (source and InputDevice.SOURCE_JOYSTICK) != 0 ||
+                (source and InputDevice.SOURCE_GAMEPAD) != 0 ||
+                (source and InputDevice.SOURCE_DPAD) != 0
+
+            if (external) {
+                val device = event.device
+                val axes = listOf(
+                    android.view.MotionEvent.AXIS_X,
+                    android.view.MotionEvent.AXIS_Y,
+                    android.view.MotionEvent.AXIS_Z,
+                    android.view.MotionEvent.AXIS_RZ,
+                    android.view.MotionEvent.AXIS_HAT_X,
+                    android.view.MotionEvent.AXIS_HAT_Y
+                )
+                val values = axes.joinToString(" | ") { axis ->
+                    "A$axis=${event.getAxisValue(axis)}"
+                }
+
+                showCaptured(
+                    title = "HID MOTION #${++eventNumber}",
+                    body =
+                        "DEVICE: ${device?.name ?: "unknown"}\n" +
+                        "SOURCE: 0x%08X\n".format(source) +
+                        "ACTION: ${event.action}\n" +
+                        values
+                )
+                return true
+            }
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
     private fun isLikelyExternalInput(event: KeyEvent): Boolean {
         val source = event.source
 
@@ -680,6 +721,8 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
     private fun startCapture() {
         captureEnabled = true
+        window.decorView.isFocusableInTouchMode = true
+        window.decorView.requestFocus()
         eventNumber = 0
         lastPacket = null
 
@@ -692,12 +735,14 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             status.text = "التقاط HID فعال"
             commandLog.text =
                 "اضغط زرًا واحدًا فقط في glaze-4.\n\n" +
-                "سيظهر حدث HID الذي وصل إلى Android (KeyEvent/MotionEvent)."
+                "سيظهر أي KeyEvent أو MotionEvent يسلّمه Android من glaze-4.\n" +
+                "لن تتغير هذه الشاشة تلقائيًا أثناء الالتقاط."
         } else {
             status.text = "في انتظار قناة الأزرار"
             commandLog.text =
                 "الجهاز محدد: glaze-4\n\n" +
-                "لكن لا توجد قناة GATT إشعار ولا HID input ظاهر حتى الآن."
+                "لا توجد قناة GATT إشعار ولا HID input ظاهر في واجهة Android العامة.\n\n" +
+                "سيبقى الالتقاط فعالًا ولن يختفي هذا التنبيه. إذا سلّم Android زرًا للتطبيق فسيظهر فورًا."
         }
     }
 
