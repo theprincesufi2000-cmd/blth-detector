@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.bluetoothinspector"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0.0"
     }
 
     compileOptions {
@@ -20,13 +20,9 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlin {
-    compilerOptions {
-        jvmTarget.set(
-            org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
-        )
+    kotlinOptions {
+        jvmTarget = "17"
     }
-}
 
     buildFeatures {
         buildConfig = true
