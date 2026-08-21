@@ -1634,7 +1634,6 @@ class MainActivity : Activity() {
         services.forEach { service ->
             val serviceUuid = service.uuid
             val isHid = serviceUuid == HID_SERVICE_UUID
-            val isCustom = isCustomService(serviceUuid)
 
             service.characteristics.forEach { c ->
                 val notify =
@@ -1642,13 +1641,18 @@ class MainActivity : Activity() {
                 val indicate =
                     c.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
 
-                // Ignore standard telemetry such as Battery Level and Generic Attribute.
-                // HID input and proprietary/custom notification channels are command candidates.
+                // STRICT BUTTON-CAPTURE MODE:
+                // Do NOT subscribe to proprietary/custom notification streams here.
+                // Your device exposes a custom NOTIFY characteristic (for example 00001002),
+                // but that channel produces continuous traffic and is not reliable evidence
+                // of a physical button press. The standard HID Input Report is the channel
+                // we want for button events.
                 val candidate =
-                    (isHid && c.uuid == HID_INPUT_REPORT_UUID) ||
-                        (isCustom && (notify || indicate))
+                    isHid &&
+                        c.uuid == HID_INPUT_REPORT_UUID &&
+                        (notify || indicate)
 
-                if (candidate && (notify || indicate)) {
+                if (candidate) {
                     candidates += c
                     commandCharacteristics += c.uuid
                 }
@@ -1659,19 +1663,20 @@ class MainActivity : Activity() {
             addSection(
                 "NO COMMAND CHANNEL",
                 """
-                No HID Input Report or custom NOTIFY/INDICATE characteristic was found.
+                No HID Input Report notification/indication was found.
 
-                This means the current connection does not expose a passive button-report channel.
+                This capture mode intentionally ignores custom NOTIFY streams because they can
+                contain continuous device telemetry rather than physical button events.
                 """.trimIndent()
             )
-            status.text = "Connected • no command notification channel found"
+            status.text = "Connected • waiting for HID button reports"
             return
         }
 
         addSection(
-            "LISTENING",
+            "LISTENING FOR PHYSICAL BUTTONS",
             candidates.joinToString("\n") {
-                "${gattUuidName(it.uuid)} • ${it.uuid} • ${properties(it.properties)}"
+                "HID Input Report • ${it.uuid} • ${properties(it.properties)}"
             }
         )
 
@@ -1693,7 +1698,7 @@ class MainActivity : Activity() {
         // HID Report Map is useful for interpreting the raw HID report later, but it is
         // not a command stream, so it is intentionally not displayed as a result.
         status.text =
-            "READY • press a button on ${safeName(g.device)}"
+            "READY • waiting for a physical button press"
     }
 
     private fun renderGattService(
@@ -2323,14 +2328,20 @@ class MainActivity : Activity() {
 
         if (!commandCaptureEnabled) return
 
-        // Only show channels selected by renderGatt().
+        // Absolute filter: only the standard HID Input Report can reach the
+        // button log. Custom notification streams are intentionally ignored.
+        if (characteristic.uuid != HID_INPUT_REPORT_UUID) return
         if (characteristic.uuid !in commandCharacteristics) return
 
-        commandCount++
-
         val previous = lastReportByUuid[characteristic.uuid]
+
+        // Many HID devices repeat the current state periodically. A repeated
+        // identical report is not a new button event, so suppress it.
+        if (previous != null && previous.contentEquals(value)) return
+
         val changed = changedBytes(previous, value)
         lastReportByUuid[characteristic.uuid] = value.copyOf()
+        commandCount++
 
         val label =
             if (characteristic.uuid == HID_INPUT_REPORT_UUID) {
