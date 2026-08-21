@@ -26,12 +26,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Parcelable
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.nio.charset.Charset
+import java.util.UUID
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
@@ -39,8 +41,8 @@ class MainActivity : Activity() {
     private lateinit var root: LinearLayout
     private lateinit var status: TextView
     private lateinit var results: LinearLayout
-    private lateinit var scanButton: Button
     private lateinit var refreshButton: Button
+    private lateinit var scanButton: Button
 
     private val btManager by lazy {
         getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
@@ -49,129 +51,60 @@ class MainActivity : Activity() {
     private val adapter: BluetoothAdapter?
         get() = btManager.adapter
 
-    private var leScanner: BluetoothLeScanner? = null
+    private var scanner: BluetoothLeScanner? = null
     private var scanning = false
     private var gatt: BluetoothGatt? = null
 
     private val seen = linkedMapOf<String, ScanResult>()
-
     private val handler = Handler(Looper.getMainLooper())
 
     private val permissionRequest = 9001
 
-    /*
-     * Classic Bluetooth SDP result receiver.
-     *
-     * fetchUuidsWithSdp() is asynchronous.
-     * Android sends ACTION_UUID when discovery completes.
-     */
+    private val BASE_UUID =
+        "-0000-1000-8000-00805F9B34FB"
+
+    private val CCCD_UUID =
+        UUID.fromString("00002902-0000-1000-8000-00805F9B34FB")
+
+    // ---------------------------------------------------------
+    // CLASSIC SDP
+    // ---------------------------------------------------------
+
     private val uuidReceiver = object : BroadcastReceiver() {
 
         override fun onReceive(context: Context?, intent: Intent?) {
 
-            if (intent?.action != BluetoothDevice.ACTION_UUID) {
-                return
+            if (intent?.action != BluetoothDevice.ACTION_UUID) return
+
+            val device =
+                intent.getParcelableExtraCompat<BluetoothDevice>(
+                    BluetoothDevice.EXTRA_DEVICE
+                ) ?: return
+
+            val uuids = try {
+                device.uuids
+                    ?.map { it.uuid }
+                    ?.distinct()
+                    ?: emptyList()
+            } catch (_: SecurityException) {
+                emptyList()
             }
 
-            try {
-
-                val device =
-                    intent.getParcelableExtraCompat<BluetoothDevice>(
-                        BluetoothDevice.EXTRA_DEVICE
-                    )
-
-                val uuidArray: Array<android.os.ParcelUuid>? =
-                    if (Build.VERSION.SDK_INT >= 33) {
-
-                        intent.getParcelableArrayExtra(
-                            BluetoothDevice.EXTRA_UUID,
-                            android.os.ParcelUuid::class.java
-                        )
-
-                    } else {
-
-                        @Suppress("DEPRECATION")
-                        intent.getParcelableArrayExtra(
-                            BluetoothDevice.EXTRA_UUID
-                        )
-                            ?.mapNotNull {
-                                it as? android.os.ParcelUuid
-                            }
-                            ?.toTypedArray()
-                    }
-
-                val uuids = uuidArray
-                    ?.map { it.uuid.toString() }
-                    ?: emptyList()
-
-                if (device == null) {
-
-                    status.text =
-                        "SDP completed, but device information was unavailable"
-
-                    addSection(
-                        "CLASSIC SDP / UUID DISCOVERY",
-                        """
-                        Device: Unknown
-
-                        UUIDs discovered: ${uuids.size}
-
-                        ${
-                            if (uuids.isEmpty()) {
-                                "No UUIDs discovered."
-                            } else {
-                                uuids.joinToString("\n")
-                            }
-                        }
-                        """.trimIndent()
-                    )
-
-                    return
-
-                }
+            runOnUiThread {
 
                 status.text =
                     "SDP discovery completed • ${safeName(device)} • ${uuids.size} UUIDs"
 
-                addSection(
-                    "CLASSIC SDP / UUID DISCOVERY",
-                    """
-                    Device: ${safeName(device)}
-                    Address: ${safeAddress(device)}
-
-                    UUIDs discovered: ${uuids.size}
-
-                    ${
-                        when {
-                            uuidArray == null ->
-                                "SDP timeout or no UUID result was returned."
-
-                            uuids.isEmpty() ->
-                                "SDP completed successfully, but no UUIDs were discovered."
-
-                            else ->
-                                uuids.joinToString("\n")
-                        }
-                    }
-                    """.trimIndent()
-                )
-
-            } catch (e: SecurityException) {
-
-                status.text = "Bluetooth permission denied"
-
-            } catch (e: Exception) {
-
-                status.text =
-                    "UUID broadcast error: ${e.message ?: "Unknown error"}"
+                renderSdpResult(device, uuids)
             }
         }
     }
 
-    /*
-     * BLE scanner callback.
-     */
-    private val leCallback = object : ScanCallback() {
+    // ---------------------------------------------------------
+    // BLE SCAN
+    // ---------------------------------------------------------
+
+    private val scanCallback = object : ScanCallback() {
 
         override fun onScanResult(
             callbackType: Int,
@@ -179,13 +112,8 @@ class MainActivity : Activity() {
         ) {
             runOnUiThread {
 
-                try {
-                    seen[result.device.address] = result
-                    renderScanResults()
-                } catch (e: Exception) {
-                    status.text =
-                        "BLE result error: ${e.message ?: "Unknown error"}"
-                }
+                seen[result.device.address] = result
+                renderScanResults()
             }
         }
 
@@ -194,32 +122,26 @@ class MainActivity : Activity() {
         ) {
             runOnUiThread {
 
-                try {
-
-                    results.forEach {
-                        seen[it.device.address] = it
-                    }
-
-                    renderScanResults()
-
-                } catch (e: Exception) {
-
-                    status.text =
-                        "BLE batch error: ${e.message ?: "Unknown error"}"
+                results.forEach {
+                    seen[it.device.address] = it
                 }
+
+                renderScanResults()
             }
         }
 
         override fun onScanFailed(errorCode: Int) {
+
             runOnUiThread {
-
                 scanning = false
-
-                status.text =
-                    "BLE scan failed: $errorCode"
+                status.text = "BLE scan failed • error=$errorCode"
             }
         }
     }
+
+    // ---------------------------------------------------------
+    // LIFECYCLE
+    // ---------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -229,25 +151,14 @@ class MainActivity : Activity() {
 
         buildUi()
 
-        /*
-         * ACTION_UUID comes from the Bluetooth system,
-         * so the receiver must be able to receive external broadcasts.
-         */
-        try {
-
-            registerReceiver(
-                uuidReceiver,
-                IntentFilter(BluetoothDevice.ACTION_UUID),
-                RECEIVER_EXPORTED
-            )
-
-        } catch (e: Exception) {
-
-            status.text =
-                "UUID receiver registration failed: ${e.message ?: "Unknown error"}"
-        }
+        registerReceiver(
+            uuidReceiver,
+            IntentFilter(BluetoothDevice.ACTION_UUID),
+            RECEIVER_NOT_EXPORTED
+        )
 
         requestBluetoothPermissions()
+
         refreshLocalInfo()
     }
 
@@ -260,21 +171,15 @@ class MainActivity : Activity() {
         } catch (_: Exception) {
         }
 
-        try {
-            gatt?.close()
-        } catch (_: Exception) {
-        }
-
+        gatt?.close()
         gatt = null
 
         super.onDestroy()
     }
 
-    /*
-     * ---------------------------------------------------------
-     * UI
-     * ---------------------------------------------------------
-     */
+    // ---------------------------------------------------------
+    // UI
+    // ---------------------------------------------------------
 
     private fun buildUi() {
 
@@ -313,10 +218,10 @@ class MainActivity : Activity() {
             lp(-1, -2)
         )
 
-        val sub = TextView(this).apply {
+        val subtitle = TextView(this).apply {
 
             text =
-                "Classic Bluetooth + BLE • GATT • SDP • RSSI • Manufacturer Data"
+                "Classic Bluetooth + BLE • SDP • GATT • RSSI • Manufacturer Data"
 
             textSize = 13f
 
@@ -333,7 +238,7 @@ class MainActivity : Activity() {
         }
 
         root.addView(
-            sub,
+            subtitle,
             lp(-1, -2)
         )
 
@@ -362,15 +267,17 @@ class MainActivity : Activity() {
             lp(-1, -2)
         )
 
-        val buttons = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
+        val buttons =
+            LinearLayout(this).apply {
+                orientation =
+                    LinearLayout.HORIZONTAL
+            }
 
         refreshButton = button("Refresh")
         scanButton = button("Scan BLE")
 
-        val stop = button("Stop")
-        val paired = button("Paired")
+        val stopButton = button("Stop")
+        val pairedButton = button("Paired")
 
         buttons.addView(
             refreshButton,
@@ -383,12 +290,12 @@ class MainActivity : Activity() {
         )
 
         buttons.addView(
-            stop,
+            stopButton,
             weightLp()
         )
 
         buttons.addView(
-            paired,
+            pairedButton,
             weightLp()
         )
 
@@ -405,28 +312,30 @@ class MainActivity : Activity() {
             startBleScan()
         }
 
-        stop.setOnClickListener {
+        stopButton.setOnClickListener {
             stopBleScan()
         }
 
-        paired.setOnClickListener {
+        pairedButton.setOnClickListener {
             renderPaired()
         }
 
-        val scroll = ScrollView(this)
+        val scroll =
+            ScrollView(this)
 
-        results = LinearLayout(this).apply {
+        results =
+            LinearLayout(this).apply {
 
-            orientation =
-                LinearLayout.VERTICAL
+                orientation =
+                    LinearLayout.VERTICAL
 
-            setPadding(
-                0,
-                dp(12),
-                0,
-                dp(30)
-            )
-        }
+                setPadding(
+                    0,
+                    dp(12),
+                    0,
+                    dp(30)
+                )
+            }
 
         scroll.addView(results)
 
@@ -442,11 +351,9 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    /*
-     * ---------------------------------------------------------
-     * LOCAL BLUETOOTH INFORMATION
-     * ---------------------------------------------------------
-     */
+    // ---------------------------------------------------------
+    // LOCAL ADAPTER
+    // ---------------------------------------------------------
 
     private fun refreshLocalInfo() {
 
@@ -464,16 +371,13 @@ class MainActivity : Activity() {
 
         val enabled =
             try {
-
                 a.isEnabled
-
             } catch (_: SecurityException) {
-
                 false
             }
 
         status.text =
-            "Bluetooth: ${if (enabled) "ON" else "OFF"} • Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+            "Bluetooth: ${if (enabled) "ON" else "OFF"} • Android ${Build.VERSION.RELEASE} • API ${Build.VERSION.SDK_INT}"
 
         addSection(
             "LOCAL ADAPTER",
@@ -482,14 +386,17 @@ class MainActivity : Activity() {
             Address: ${tryAddress(a)}
             Enabled: $enabled
             State: ${tryState(a)}
-            Hardware supported: ${packageManager.hasSystemFeature("android.hardware.bluetooth")}
+            Bluetooth supported: ${packageManager.hasSystemFeature("android.hardware.bluetooth")}
             BLE supported: ${packageManager.hasSystemFeature("android.hardware.bluetooth_le")}
-            Multiple advertisement supported: ${packageManager.hasSystemFeature("android.hardware.bluetooth_le")}
             """.trimIndent()
         )
 
         renderPaired()
     }
+
+    // ---------------------------------------------------------
+    // PAIRED DEVICES
+    // ---------------------------------------------------------
 
     private fun renderPaired() {
 
@@ -502,11 +409,8 @@ class MainActivity : Activity() {
 
         val devices =
             try {
-
                 a.bondedDevices.toList()
-
             } catch (_: SecurityException) {
-
                 emptyList()
             }
 
@@ -514,7 +418,7 @@ class MainActivity : Activity() {
 
             addSection(
                 "PAIRED",
-                "No paired devices visible to this app."
+                "No paired devices visible to this application."
             )
 
             return
@@ -534,190 +438,9 @@ class MainActivity : Activity() {
             }
     }
 
-    /*
-     * ---------------------------------------------------------
-     * BLE SCANNING
-     * ---------------------------------------------------------
-     */
-
-    private fun renderScanResults() {
-
-        val scan =
-            seen.values
-                .sortedByDescending {
-                    it.rssi
-                }
-
-        val header =
-            findOrCreateSection("LIVE BLE SCAN")
-
-        header.removeAllViews()
-
-        addHeader(
-            header,
-            "LIVE BLE SCAN",
-            "${scan.size} unique addresses"
-        )
-
-        if (scan.isEmpty()) {
-
-            addText(
-                header,
-                "No BLE advertisements captured yet."
-            )
-
-            return
-        }
-
-        scan.forEach { result ->
-
-            val d = result.device
-
-            val md = result.scanRecord
-
-            val sb = StringBuilder()
-
-            sb.append(
-                "Name: ${safeName(d)}\n"
-            )
-
-            sb.append(
-                "Address: ${safeAddress(d)}\n"
-            )
-
-            sb.append(
-                "RSSI: ${result.rssi} dBm\n"
-            )
-
-            sb.append(
-                "TX power: ${
-                    if (
-                        result.txPower !=
-                        ScanResult.TX_POWER_NOT_PRESENT
-                    ) {
-                        result.txPower
-                    } else {
-                        "N/A"
-                    }
-                }\n"
-            )
-
-            sb.append(
-                "Connectable: ${
-                    if (Build.VERSION.SDK_INT >= 26) {
-                        result.isConnectable
-                    } else {
-                        "unknown"
-                    }
-                }\n"
-            )
-
-            sb.append(
-                "Device type: ${typeName(d.type)}\n"
-            )
-
-            if (md != null) {
-
-                sb.append(
-                    "Advertise flags: ${md.advertiseFlags}\n"
-                )
-
-                sb.append(
-                    "Service UUIDs: ${
-                        md.serviceUuids
-                            ?.joinToString {
-                                it.uuid.toString()
-                            }
-                            ?: "none"
-                    }\n"
-                )
-
-                sb.append(
-                    "Service data: ${
-                        formatMap(md.serviceData)
-                    }\n"
-                )
-
-                sb.append(
-                    "Manufacturer data: ${
-                        formatManufacturer(
-                            md.manufacturerSpecificData
-                        )
-                    }\n"
-                )
-
-                sb.append(
-                    "Raw advertising bytes: ${
-                        hex(md.bytes)
-                    }\n"
-                )
-            }
-
-            addSection(
-                "BLE DEVICE • ${safeName(d)}",
-                sb.toString()
-            )
-
-            addActionRow(
-                d,
-                true
-            )
-        }
-    }
-
-    private fun addActionRow(
-        device: BluetoothDevice,
-        ble: Boolean
-    ) {
-
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-
-        val connect =
-            button(
-                if (ble) {
-                    "Connect GATT"
-                } else {
-                    "Inspect SDP"
-                }
-            )
-
-        val uuids =
-            button("Fetch UUIDs")
-
-        row.addView(
-            connect,
-            weightLp()
-        )
-
-        row.addView(
-            uuids,
-            weightLp()
-        )
-
-        connect.setOnClickListener {
-
-            if (ble) {
-
-                connectGatt(device)
-
-            } else {
-
-                inspectSdp(device)
-            }
-        }
-
-        uuids.setOnClickListener {
-
-            inspectSdp(device)
-        }
-
-        results.addView(
-            row,
-            lp(-1, -2)
-        )
-    }
+    // ---------------------------------------------------------
+    // CLASSIC DEVICE CARD
+    // ---------------------------------------------------------
 
     private fun renderDeviceCard(
         device: BluetoothDevice,
@@ -725,85 +448,114 @@ class MainActivity : Activity() {
         tag: String
     ) {
 
-        val sb = StringBuilder()
+        val body =
+            buildString {
 
-        sb.append(
-            "Name: ${safeName(device)}\n"
-        )
+                append(
+                    "Name: ${safeName(device)}\n"
+                )
 
-        sb.append(
-            "Address: ${safeAddress(device)}\n"
-        )
+                append(
+                    "Address: ${safeAddress(device)}\n"
+                )
 
-        sb.append(
-            "Type: ${typeName(device.type)}\n"
-        )
+                append(
+                    "Type: ${typeName(device.type)}\n"
+                )
 
-        sb.append(
-            "Bond: ${bondName(device.bondState)}\n"
-        )
+                append(
+                    "Bond: ${bondName(device.bondState)}\n"
+                )
 
-        if (result != null) {
+                if (result != null) {
 
-            sb.append(
-                "RSSI: ${result.rssi} dBm\n"
-            )
-        }
+                    append(
+                        "RSSI: ${result.rssi} dBm\n"
+                    )
+                }
 
-        val cls =
-            try {
-
-                device.bluetoothClass
-
-            } catch (_: SecurityException) {
-
-                null
-            }
-
-        if (cls != null) {
-
-            sb.append(
-                "Class: ${cls.deviceClass} (${cls.majorDeviceClass})\n"
-            )
-
-            sb.append(
-                "Class hex: 0x${cls.hashCode().toString(16)}\n"
-            )
-        }
-
-        val uuids =
-            try {
-
-                device.uuids
-                    ?.joinToString("\n") {
-                        it.uuid.toString()
+                val clazz =
+                    try {
+                        device.bluetoothClass
+                    } catch (_: SecurityException) {
+                        null
                     }
 
-            } catch (_: SecurityException) {
+                if (clazz != null) {
 
-                null
+                    append(
+                        "Class: ${clazz.deviceClass} (${clazz.majorDeviceClass})\n"
+                    )
+
+                    append(
+                        "Class hex: 0x${clazz.hashCode().toString(16)}\n"
+                    )
+                }
+
+                val uuids =
+                    try {
+                        device.uuids
+                            ?.joinToString("\n") {
+                                it.uuid.toString()
+                            }
+                    } catch (_: SecurityException) {
+                        null
+                    }
+
+                append(
+                    "Cached UUIDs:\n${uuids ?: "none"}"
+                )
             }
 
-        sb.append(
-            "Cached UUIDs:\n${uuids ?: "none"}"
+        val card =
+            createSection(
+                "$tag • ${safeName(device)}"
+            )
+
+        addText(
+            card,
+            body
         )
 
-        addSection(
-            "$tag • ${safeName(device)}",
-            sb.toString()
+        val row =
+            LinearLayout(this).apply {
+                orientation =
+                    LinearLayout.HORIZONTAL
+            }
+
+        val sdpButton =
+            button("Inspect SDP")
+
+        val fetchButton =
+            button("Fetch UUIDs")
+
+        row.addView(
+            sdpButton,
+            weightLp()
         )
 
-        addActionRow(
-            device,
-            false
+        row.addView(
+            fetchButton,
+            weightLp()
+        )
+
+        sdpButton.setOnClickListener {
+            inspectSdp(device)
+        }
+
+        fetchButton.setOnClickListener {
+            inspectSdp(device)
+        }
+
+        card.addView(
+            row,
+            lp(-1, -2)
         )
     }
 
-    /*
-     * ---------------------------------------------------------
-     * CLASSIC BLUETOOTH / SDP
-     * ---------------------------------------------------------
-     */
+    // ---------------------------------------------------------
+    // SDP
+    // ---------------------------------------------------------
 
     private fun inspectSdp(
         device: BluetoothDevice
@@ -813,27 +565,27 @@ class MainActivity : Activity() {
 
             requestBluetoothPermissions()
 
-            status.text =
-                "Bluetooth Connect permission is required"
-
             return
         }
 
         try {
 
-            @Suppress("DEPRECATION")
-            val started =
-                device.fetchUuidsWithSdp()
-
             status.text =
-                if (started) {
+                "SDP UUID discovery requested for ${safeName(device)}"
 
-                    "SDP discovery started for ${safeName(device)}…"
-
+            val requested =
+                if (Build.VERSION.SDK_INT >= 33) {
+                    device.fetchUuidsWithSdp()
                 } else {
-
-                    "SDP discovery could not be started"
+                    @Suppress("DEPRECATION")
+                    device.fetchUuidsWithSdp()
                 }
+
+            if (!requested) {
+
+                status.text =
+                    "SDP request was not accepted by Android"
+            }
 
         } catch (e: SecurityException) {
 
@@ -843,15 +595,599 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
 
             status.text =
-                "SDP error: ${e.message ?: "Unknown error"}"
+                "SDP error: ${e.message}"
         }
     }
 
-    /*
-     * ---------------------------------------------------------
-     * GATT
-     * ---------------------------------------------------------
-     */
+    private fun renderSdpResult(
+        device: BluetoothDevice,
+        uuids: List<UUID>
+    ) {
+
+        val card =
+            createSection(
+                "CLASSIC SDP / UUID DISCOVERY"
+            )
+
+        addText(
+            card,
+            """
+            Device: ${safeName(device)}
+            Address: ${safeAddress(device)}
+            Type: ${typeName(device.type)}
+            Bond: ${bondName(device.bondState)}
+            UUIDs discovered: ${uuids.size}
+            """.trimIndent()
+        )
+
+        if (uuids.isEmpty()) {
+
+            addText(
+                card,
+                "No UUIDs returned by the Bluetooth stack."
+            )
+
+            return
+        }
+
+        uuids.forEach { uuid ->
+
+            val service =
+                LinearLayout(this).apply {
+
+                    orientation =
+                        LinearLayout.VERTICAL
+
+                    setPadding(
+                        dp(10),
+                        dp(10),
+                        dp(10),
+                        dp(10)
+                    )
+
+                    setBackgroundColor(
+                        getColor(R.color.bg)
+                    )
+                }
+
+            val title =
+                TextView(this).apply {
+
+                    text =
+                        profileName(uuid)
+
+                    textSize = 15f
+
+                    typeface =
+                        android.graphics.Typeface.DEFAULT_BOLD
+
+                    setTextColor(
+                        getColor(R.color.text)
+                    )
+                }
+
+            service.addView(
+                title,
+                lp(-1, -2)
+            )
+
+            val detail =
+                TextView(this).apply {
+
+                    text =
+                        "UUID: ${uuid.toString().uppercase()}\n" +
+                        "Category: ${uuidCategory(uuid)}"
+
+                    textSize = 12f
+
+                    setTextColor(
+                        getColor(R.color.muted)
+                    )
+
+                    typeface =
+                        android.graphics.Typeface.MONOSPACE
+                }
+
+            service.addView(
+                detail,
+                lp(-1, -2)
+            )
+
+            card.addView(
+                service,
+                lp(-1, -2)
+            )
+        }
+    }
+
+    private fun profileName(
+        uuid: UUID
+    ): String {
+
+        return when (uuid.toString().lowercase()) {
+
+            "00001101-0000-1000-8000-00805f9b34fb" ->
+                "Serial Port Profile (SPP)"
+
+            "00001108-0000-1000-8000-00805f9b34fb" ->
+                "Headset Profile (HSP)"
+
+            "0000110a-0000-1000-8000-00805f9b34fb" ->
+                "A2DP Source"
+
+            "0000110b-0000-1000-8000-00805f9b34fb" ->
+                "A2DP Sink"
+
+            "0000110c-0000-1000-8000-00805f9b34fb" ->
+                "A/V Remote Control Target"
+
+            "0000110d-0000-1000-8000-00805f9b34fb" ->
+                "Advanced Audio Distribution"
+
+            "0000110e-0000-1000-8000-00805f9b34fb" ->
+                "A/V Remote Control / AVRCP"
+
+            "00001112-0000-1000-8000-00805f9b34fb" ->
+                "Headset Audio Gateway"
+
+            "0000111e-0000-1000-8000-00805f9b34fb" ->
+                "Hands-Free Profile (HFP)"
+
+            "0000111f-0000-1000-8000-00805f9b34fb" ->
+                "Hands-Free Audio Gateway"
+
+            "00001115-0000-1000-8000-00805f9b34fb" ->
+                "PAN User"
+
+            "00001116-0000-1000-8000-00805f9b34fb" ->
+                "PAN Network Access Point"
+
+            "00001124-0000-1000-8000-00805f9b34fb" ->
+                "Human Interface Device (HID)"
+
+            "0000112f-0000-1000-8000-00805f9b34fb" ->
+                "Phonebook Access Server"
+
+            "00001132-0000-1000-8000-00805f9b34fb" ->
+                "Message Access Server"
+
+            "00001133-0000-1000-8000-00805f9b34fb" ->
+                "Message Notification Server"
+
+            "00001200-0000-1000-8000-00805f9b34fb" ->
+                "PnP Information"
+
+            else ->
+                "Unknown / Custom Classic Service"
+        }
+    }
+
+    private fun uuidCategory(
+        uuid: UUID
+    ): String {
+
+        val value =
+            uuid.toString().lowercase()
+
+        return when {
+
+            value.endsWith(
+                "-0000-1000-8000-00805f9b34fb"
+            ) ->
+                "Bluetooth SIG 16-bit based UUID"
+
+            else ->
+                "Custom UUID"
+        }
+    }
+
+    // ---------------------------------------------------------
+    // BLE SCAN
+    // ---------------------------------------------------------
+
+    private fun startBleScan() {
+
+        if (!hasScanPermission()) {
+
+            requestBluetoothPermissions()
+
+            return
+        }
+
+        val a = adapter
+
+        if (a == null) {
+
+            status.text =
+                "Bluetooth adapter unavailable"
+
+            return
+        }
+
+        val enabled =
+            try {
+                a.isEnabled
+            } catch (_: SecurityException) {
+                false
+            }
+
+        if (!enabled) {
+
+            startActivity(
+                Intent(
+                    BluetoothAdapter.ACTION_REQUEST_ENABLE
+                )
+            )
+
+            return
+        }
+
+        if (scanning) return
+
+        seen.clear()
+
+        scanner =
+            try {
+                a.bluetoothLeScanner
+            } catch (_: SecurityException) {
+                null
+            }
+
+        if (scanner == null) {
+
+            status.text =
+                "BLE scanner unavailable"
+
+            return
+        }
+
+        scanning = true
+
+        status.text =
+            "BLE scan running…"
+
+        renderScanResults()
+
+        try {
+
+            val settings =
+                ScanSettings.Builder()
+                    .setScanMode(
+                        ScanSettings.SCAN_MODE_LOW_LATENCY
+                    )
+                    .build()
+
+            scanner?.startScan(
+                null,
+                settings,
+                scanCallback
+            )
+
+            handler.removeCallbacksAndMessages(null)
+
+            handler.postDelayed(
+                {
+                    stopBleScan()
+                },
+                15000
+            )
+
+        } catch (e: SecurityException) {
+
+            scanning = false
+
+            status.text =
+                "BLE permission denied"
+
+        } catch (e: Exception) {
+
+            scanning = false
+
+            status.text =
+                "BLE scan error: ${e.message}"
+        }
+    }
+
+    private fun stopBleScan() {
+
+        handler.removeCallbacksAndMessages(null)
+
+        if (!scanning) return
+
+        try {
+
+            scanner?.stopScan(
+                scanCallback
+            )
+
+        } catch (_: Exception) {
+        }
+
+        scanning = false
+
+        status.text =
+            "BLE scan stopped • ${seen.size} devices"
+    }
+
+    // ---------------------------------------------------------
+    // BLE RESULTS
+    // ---------------------------------------------------------
+
+    private fun renderScanResults() {
+
+        val card =
+            findOrCreateSection(
+                "LIVE BLE SCAN"
+            )
+
+        card.removeAllViews()
+
+        addHeader(
+            card,
+            "LIVE BLE SCAN",
+            "${seen.size} devices"
+        )
+
+        if (seen.isEmpty()) {
+
+            addText(
+                card,
+                "No BLE advertisements captured yet."
+            )
+
+            return
+        }
+
+        val sorted =
+            seen.values
+                .sortedByDescending {
+                    it.rssi
+                }
+
+        sorted.forEach { result ->
+
+            val device =
+                result.device
+
+            val record =
+                result.scanRecord
+
+            val item =
+                LinearLayout(this).apply {
+
+                    orientation =
+                        LinearLayout.VERTICAL
+
+                    setPadding(
+                        dp(12),
+                        dp(12),
+                        dp(12),
+                        dp(12)
+                    )
+
+                    setBackgroundColor(
+                        getColor(R.color.bg)
+                    )
+                }
+
+            addText(
+                item,
+                buildString {
+
+                    append(
+                        "Name: ${safeName(device)}\n"
+                    )
+
+                    append(
+                        "Address: ${safeAddress(device)}\n"
+                    )
+
+                    append(
+                        "RSSI: ${result.rssi} dBm\n"
+                    )
+
+                    append(
+                        "TX Power: ${
+                            if (
+                                result.txPower !=
+                                ScanResult.TX_POWER_NOT_PRESENT
+                            ) {
+                                result.txPower
+                            } else {
+                                "N/A"
+                            }
+                        }\n"
+                    )
+
+                    append(
+                        "Connectable: ${
+                            if (Build.VERSION.SDK_INT >= 26) {
+                                result.isConnectable
+                            } else {
+                                "unknown"
+                            }
+                        }\n"
+                    )
+
+                    append(
+                        "Device Type: ${typeName(device.type)}\n"
+                    )
+
+                    if (record != null) {
+
+                        append(
+                            "Advertise Flags: ${record.advertiseFlags}\n"
+                        )
+
+                        append(
+                            "Service UUIDs: ${
+                                record.serviceUuids
+                                    ?.joinToString {
+                                        it.uuid.toString()
+                                    }
+                                    ?: "none"
+                            }\n"
+                        )
+
+                        append(
+                            "Service Data:\n${formatMap(record.serviceData)}\n"
+                        )
+
+                        append(
+                            "Manufacturer Data:\n${
+                                formatManufacturer(
+                                    record.manufacturerSpecificData
+                                )
+                            }\n"
+                        )
+
+                        append(
+                            "Raw Advertisement:\n${hex(record.bytes)}"
+                        )
+                    }
+                }
+            )
+
+            val actions =
+                LinearLayout(this).apply {
+                    orientation =
+                        LinearLayout.HORIZONTAL
+                }
+
+            val connect =
+                button("Connect GATT")
+
+            val details =
+                button("Details")
+
+            actions.addView(
+                connect,
+                weightLp()
+            )
+
+            actions.addView(
+                details,
+                weightLp()
+            )
+
+            connect.setOnClickListener {
+
+                if (
+                    device.type ==
+                    BluetoothDevice.DEVICE_TYPE_CLASSIC
+                ) {
+
+                    status.text =
+                        "This device is Classic Bluetooth, not BLE."
+
+                } else {
+
+                    connectGatt(device)
+                }
+            }
+
+            details.setOnClickListener {
+
+                showBleDetails(
+                    result
+                )
+            }
+
+            item.addView(
+                actions,
+                lp(-1, -2)
+            )
+
+            card.addView(
+                item,
+                lp(-1, -2)
+            )
+        }
+    }
+
+    private fun showBleDetails(
+        result: ScanResult
+    ) {
+
+        val record =
+            result.scanRecord
+
+        val text =
+            buildString {
+
+                append(
+                    "Name: ${safeName(result.device)}\n\n"
+                )
+
+                append(
+                    "Address: ${safeAddress(result.device)}\n\n"
+                )
+
+                append(
+                    "RSSI: ${result.rssi} dBm\n"
+                )
+
+                append(
+                    "TX Power: ${result.txPower}\n"
+                )
+
+                if (record != null) {
+
+                    append(
+                        "\nService UUIDs:\n"
+                    )
+
+                    append(
+                        record.serviceUuids
+                            ?.joinToString("\n") {
+                                it.uuid.toString()
+                            }
+                            ?: "none"
+                    )
+
+                    append(
+                        "\n\nManufacturer Data:\n"
+                    )
+
+                    append(
+                        formatManufacturer(
+                            record.manufacturerSpecificData
+                        )
+                    )
+
+                    append(
+                        "\n\nService Data:\n"
+                    )
+
+                    append(
+                        formatMap(
+                            record.serviceData
+                        )
+                    )
+
+                    append(
+                        "\n\nRaw Advertisement:\n"
+                    )
+
+                    append(
+                        hex(record.bytes)
+                    )
+                }
+            }
+
+        AlertDialog.Builder(this)
+            .setTitle("BLE Advertisement")
+            .setMessage(text)
+            .setPositiveButton(
+                "Close",
+                null
+            )
+            .show()
+    }
+
+    // ---------------------------------------------------------
+    // GATT CONNECTION
+    // ---------------------------------------------------------
 
     private fun connectGatt(
         device: BluetoothDevice
@@ -861,10 +1197,12 @@ class MainActivity : Activity() {
 
             requestBluetoothPermissions()
 
-            status.text =
-                "Bluetooth Connect permission is required"
-
             return
+        }
+
+        try {
+            gatt?.disconnect()
+        } catch (_: Exception) {
         }
 
         try {
@@ -902,16 +1240,18 @@ class MainActivity : Activity() {
         } catch (e: SecurityException) {
 
             status.text =
-                "Bluetooth permission denied"
+                "GATT permission denied"
 
         } catch (e: Exception) {
 
             status.text =
-                "GATT connection error: ${
-                    e.message ?: "Unknown error"
-                }"
+                "GATT connection error: ${e.message}"
         }
     }
+
+    // ---------------------------------------------------------
+    // GATT CALLBACK
+    // ---------------------------------------------------------
 
     private val gattCallback =
         object : BluetoothGattCallback() {
@@ -924,55 +1264,54 @@ class MainActivity : Activity() {
 
                 runOnUiThread {
 
-                    val stateText =
-                        when (newState) {
+                    when (newState) {
 
-                            BluetoothProfile.STATE_CONNECTED ->
-                                "CONNECTED"
+                        BluetoothProfile.STATE_CONNECTED -> {
 
-                            BluetoothProfile.STATE_CONNECTING ->
-                                "CONNECTING"
+                            status.text =
+                                "GATT CONNECTED • ${safeName(g.device)}"
 
-                            BluetoothProfile.STATE_DISCONNECTING ->
-                                "DISCONNECTING"
+                            addSection(
+                                "GATT CONNECTION",
+                                """
+                                Device: ${safeName(g.device)}
+                                Address: ${safeAddress(g.device)}
+                                State: CONNECTED
+                                Status code: $statusCode
+                                """.trimIndent()
+                            )
 
-                            BluetoothProfile.STATE_DISCONNECTED ->
-                                "DISCONNECTED"
+                            try {
 
-                            else ->
-                                "UNKNOWN"
-                        }
-
-                    status.text =
-                        "GATT ${safeName(g.device)}: $stateText (status=$statusCode)"
-
-                    if (
-                        newState ==
-                        BluetoothProfile.STATE_CONNECTED
-                    ) {
-
-                        try {
-
-                            val started =
                                 g.discoverServices()
 
-                            if (!started) {
+                            } catch (e: Exception) {
 
                                 status.text =
-                                    "GATT connected, service discovery could not start"
+                                    "Service discovery error: ${e.message}"
                             }
+                        }
 
-                        } catch (e: SecurityException) {
-
-                            status.text =
-                                "Bluetooth permission denied"
-
-                        } catch (e: Exception) {
+                        BluetoothProfile.STATE_DISCONNECTED -> {
 
                             status.text =
-                                "Service discovery error: ${
-                                    e.message ?: "Unknown error"
-                                }"
+                                "GATT DISCONNECTED • ${safeName(g.device)}"
+
+                            addSection(
+                                "GATT CONNECTION",
+                                """
+                                Device: ${safeName(g.device)}
+                                Address: ${safeAddress(g.device)}
+                                State: DISCONNECTED
+                                Status code: $statusCode
+                                """.trimIndent()
+                            )
+                        }
+
+                        else -> {
+
+                            status.text =
+                                "GATT state=$newState status=$statusCode"
                         }
                     }
                 }
@@ -992,6 +1331,7 @@ class MainActivity : Activity() {
                 }
             }
 
+            // Android 13+
             override fun onCharacteristicRead(
                 g: BluetoothGatt,
                 c: BluetoothGattCharacteristic,
@@ -1001,18 +1341,41 @@ class MainActivity : Activity() {
 
                 runOnUiThread {
 
-                    addSection(
+                    renderGattData(
                         "GATT READ",
-                        """
-                        Characteristic: ${c.uuid}
-                        Status: $statusCode
-                        Value HEX: ${hex(value)}
-                        Value UTF-8: ${printable(value)}
-                        """.trimIndent()
+                        c.uuid,
+                        value,
+                        statusCode
                     )
                 }
             }
 
+            // Older Android
+            @Deprecated("Deprecated in Android 13")
+            override fun onCharacteristicRead(
+                g: BluetoothGatt,
+                c: BluetoothGattCharacteristic,
+                statusCode: Int
+            ) {
+
+                if (Build.VERSION.SDK_INT < 33) {
+
+                    val value =
+                        c.value ?: ByteArray(0)
+
+                    runOnUiThread {
+
+                        renderGattData(
+                            "GATT READ",
+                            c.uuid,
+                            value,
+                            statusCode
+                        )
+                    }
+                }
+            }
+
+            // Android 13+
             override fun onCharacteristicChanged(
                 g: BluetoothGatt,
                 c: BluetoothGattCharacteristic,
@@ -1021,34 +1384,32 @@ class MainActivity : Activity() {
 
                 runOnUiThread {
 
-                    addSection(
-                        "GATT NOTIFICATION",
-                        """
-                        Characteristic: ${c.uuid}
-                        Value HEX: ${hex(value)}
-                        Value UTF-8: ${printable(value)}
-                        """.trimIndent()
+                    renderNotification(
+                        c,
+                        value
                     )
                 }
             }
 
-            override fun onDescriptorRead(
+            // Older Android
+            @Deprecated("Deprecated in Android 13")
+            override fun onCharacteristicChanged(
                 g: BluetoothGatt,
-                d: BluetoothGattDescriptor,
-                statusCode: Int,
-                value: ByteArray
+                c: BluetoothGattCharacteristic
             ) {
 
-                runOnUiThread {
+                if (Build.VERSION.SDK_INT < 33) {
 
-                    addSection(
-                        "DESCRIPTOR READ",
-                        """
-                        Descriptor: ${d.uuid}
-                        Status: $statusCode
-                        Value HEX: ${hex(value)}
-                        """.trimIndent()
-                    )
+                    val value =
+                        c.value ?: ByteArray(0)
+
+                    runOnUiThread {
+
+                        renderNotification(
+                            c,
+                            value
+                        )
+                    }
                 }
             }
 
@@ -1069,7 +1430,79 @@ class MainActivity : Activity() {
                     )
                 }
             }
+
+            // Android 13+
+            override fun onDescriptorRead(
+                g: BluetoothGatt,
+                d: BluetoothGattDescriptor,
+                statusCode: Int,
+                value: ByteArray
+            ) {
+
+                runOnUiThread {
+
+                    addSection(
+                        "DESCRIPTOR READ",
+                        """
+                        Descriptor: ${d.uuid}
+                        Status: $statusCode
+                        HEX: ${hex(value)}
+                        TEXT: ${printable(value)}
+                        """.trimIndent()
+                    )
+                }
+            }
+
+            // Older Android
+            @Deprecated("Deprecated in Android 13")
+            override fun onDescriptorRead(
+                g: BluetoothGatt,
+                d: BluetoothGattDescriptor,
+                statusCode: Int
+            ) {
+
+                if (Build.VERSION.SDK_INT < 33) {
+
+                    val value =
+                        d.value ?: ByteArray(0)
+
+                    runOnUiThread {
+
+                        addSection(
+                            "DESCRIPTOR READ",
+                            """
+                            Descriptor: ${d.uuid}
+                            Status: $statusCode
+                            HEX: ${hex(value)}
+                            TEXT: ${printable(value)}
+                            """.trimIndent()
+                        )
+                    }
+                }
+            }
+
+            override fun onDescriptorWrite(
+                g: BluetoothGatt,
+                d: BluetoothGattDescriptor,
+                statusCode: Int
+            ) {
+
+                runOnUiThread {
+
+                    addSection(
+                        "DESCRIPTOR WRITE",
+                        """
+                        Descriptor: ${d.uuid}
+                        Status: $statusCode
+                        """.trimIndent()
+                    )
+                }
+            }
         }
+
+    // ---------------------------------------------------------
+    // GATT DATABASE
+    // ---------------------------------------------------------
 
     private fun renderGatt(
         g: BluetoothGatt,
@@ -1078,11 +1511,8 @@ class MainActivity : Activity() {
 
         val services =
             try {
-
                 g.services
-
             } catch (_: Exception) {
-
                 emptyList<BluetoothGattService>()
             }
 
@@ -1090,303 +1520,353 @@ class MainActivity : Activity() {
             "GATT DATABASE",
             """
             Device: ${safeName(g.device)}
-            Status: $statusCode
+            Address: ${safeAddress(g.device)}
+            Connection: CONNECTED
+            Discovery status: $statusCode
             Services: ${services.size}
             """.trimIndent()
         )
 
-        services.forEach { s ->
+        services.forEach { service ->
 
-            addSection(
-                "SERVICE • ${s.uuid}",
-                buildString {
-
-                    append(
-                        "Instance ID: ${s.instanceId}\n"
-                    )
-
-                    append(
-                        "Type: ${
-                            if (
-                                s.type ==
-                                BluetoothGattService.SERVICE_TYPE_PRIMARY
-                            ) {
-                                "PRIMARY"
-                            } else {
-                                "SECONDARY"
-                            }
-                        }\n"
-                    )
-
-                    append(
-                        "Characteristics: ${s.characteristics.size}\n\n"
-                    )
-
-                    s.characteristics.forEach { c ->
-
-                        append(
-                            "CHARACTERISTIC ${c.uuid}\n"
-                        )
-
-                        append(
-                            "  Properties: ${
-                                properties(c.properties)
-                            }\n"
-                        )
-
-                        append(
-                            "  Permissions: ${
-                                permissions(c.permissions)
-                            }\n"
-                        )
-
-                        append(
-                            "  Write type: ${
-                                c.writeType
-                            }\n"
-                        )
-
-                        append(
-                            "  Descriptors: ${
-                                c.descriptors.size
-                            }\n"
-                        )
-
-                        c.descriptors.forEach { d ->
-
-                            append(
-                                "    DESC ${d.uuid} permissions=${
-                                    permissions(
-                                        d.permissions
-                                    )
-                                }\n"
-                            )
-                        }
-
-                        append("\n")
-                    }
-                }
-            )
-
-            addGattControls(
+            renderGattService(
                 g,
-                s
+                service
             )
         }
     }
 
-    private fun addGattControls(
+    private fun renderGattService(
         g: BluetoothGatt,
         service: BluetoothGattService
     ) {
 
-        service.characteristics.forEach { c ->
+        val card =
+            createSection(
+                "SERVICE • ${service.uuid}"
+            )
 
-            val row =
-                LinearLayout(this).apply {
-                    orientation =
-                        LinearLayout.HORIZONTAL
+        addText(
+            card,
+            """
+            Name: ${gattUuidName(service.uuid)}
+            Type: ${
+                if (
+                    service.type ==
+                    BluetoothGattService.SERVICE_TYPE_PRIMARY
+                ) {
+                    "PRIMARY"
+                } else {
+                    "SECONDARY"
                 }
-
-            if (
-                c.properties and
-                BluetoothGattCharacteristic.PROPERTY_READ != 0
-            ) {
-
-                val read =
-                    button(
-                        "Read ${c.uuid.toString().take(8)}"
-                    )
-
-                read.setOnClickListener {
-
-                    if (!hasConnectPermission()) {
-
-                        requestBluetoothPermissions()
-
-                        status.text =
-                            "Bluetooth Connect permission is required"
-
-                        return@setOnClickListener
-                    }
-
-                    try {
-
-                        val started =
-                            g.readCharacteristic(c)
-
-                        status.text =
-                            if (started) {
-                                "Reading ${c.uuid}…"
-                            } else {
-                                "Read could not be started: ${c.uuid}"
-                            }
-
-                    } catch (e: SecurityException) {
-
-                        status.text =
-                            "Bluetooth permission denied"
-
-                    } catch (e: Exception) {
-
-                        status.text =
-                            e.message ?: "Read error"
-                    }
-                }
-
-                row.addView(
-                    read,
-                    weightLp()
-                )
             }
+            Instance ID: ${service.instanceId}
+            Characteristics: ${service.characteristics.size}
+            """.trimIndent()
+        )
 
-            if (
-                c.properties and
-                (
-                    BluetoothGattCharacteristic.PROPERTY_NOTIFY or
-                        BluetoothGattCharacteristic.PROPERTY_INDICATE
-                    ) != 0
-            ) {
+        service.characteristics.forEach { characteristic ->
 
-                val notify =
-                    button(
-                        "Notify ${c.uuid.toString().take(8)}"
-                    )
-
-                notify.setOnClickListener {
-
-                    enableNotifications(
-                        g,
-                        c
-                    )
-                }
-
-                row.addView(
-                    notify,
-                    weightLp()
-                )
-            }
-
-            if (
-                c.properties and
-                (
-                    BluetoothGattCharacteristic.PROPERTY_WRITE or
-                        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
-                    ) != 0
-            ) {
-
-                val test =
-                    button("Write UI")
-
-                test.setOnClickListener {
-
-                    showWriteDialog(
-                        g,
-                        c
-                    )
-                }
-
-                row.addView(
-                    test,
-                    weightLp()
-                )
-            }
-
-            if (row.childCount > 0) {
-
-                results.addView(
-                    row,
-                    lp(-1, -2)
-                )
-            }
+            renderCharacteristic(
+                g,
+                card,
+                characteristic
+            )
         }
     }
 
-    /*
-     * Enable notifications/indications and also write the
-     * standard CCC descriptor when available.
-     */
-    private fun enableNotifications(
+    private fun renderCharacteristic(
         g: BluetoothGatt,
-        c: BluetoothGattCharacteristic
+        parent: LinearLayout,
+        characteristic: BluetoothGattCharacteristic
+    ) {
+
+        val box =
+            LinearLayout(this).apply {
+
+                orientation =
+                    LinearLayout.VERTICAL
+
+                setPadding(
+                    dp(10),
+                    dp(10),
+                    dp(10),
+                    dp(10)
+                )
+
+                setBackgroundColor(
+                    getColor(R.color.bg)
+                )
+            }
+
+        addText(
+            box,
+            """
+            CHARACTERISTIC
+            UUID: ${characteristic.uuid}
+            Name: ${gattUuidName(characteristic.uuid)}
+            Properties: ${properties(characteristic.properties)}
+            Permissions: ${characteristicPermissions(characteristic.permissions)}
+            Write Type: ${writeTypeName(characteristic.writeType)}
+            Descriptors: ${characteristic.descriptors.size}
+            """.trimIndent()
+        )
+
+        characteristic.descriptors.forEach { descriptor ->
+
+            addText(
+                box,
+                """
+                DESCRIPTOR
+                UUID: ${descriptor.uuid}
+                Name: ${gattUuidName(descriptor.uuid)}
+                Permissions: ${descriptorPermissions(descriptor.permissions)}
+                """.trimIndent()
+            )
+        }
+
+        val controls =
+            LinearLayout(this).apply {
+                orientation =
+                    LinearLayout.HORIZONTAL
+            }
+
+        if (
+            characteristic.properties and
+            BluetoothGattCharacteristic.PROPERTY_READ != 0
+        ) {
+
+            val read =
+                button("Read")
+
+            read.setOnClickListener {
+
+                try {
+
+                    if (Build.VERSION.SDK_INT >= 33) {
+
+                        g.readCharacteristic(
+                            characteristic
+                        )
+
+                    } else {
+
+                        @Suppress("DEPRECATION")
+                        g.readCharacteristic(
+                            characteristic
+                        )
+                    }
+
+                } catch (e: Exception) {
+
+                    status.text =
+                        "Read error: ${e.message}"
+                }
+            }
+
+            controls.addView(
+                read,
+                weightLp()
+            )
+        }
+
+        if (
+            characteristic.properties and
+            (
+                BluetoothGattCharacteristic.PROPERTY_WRITE or
+                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
+                ) != 0
+        ) {
+
+            val write =
+                button("Write")
+
+            write.setOnClickListener {
+
+                showWriteDialog(
+                    g,
+                    characteristic
+                )
+            }
+
+            controls.addView(
+                write,
+                weightLp()
+            )
+        }
+
+        if (
+            characteristic.properties and
+            BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+        ) {
+
+            val notify =
+                button("Notify ON")
+
+            notify.setOnClickListener {
+
+                enableNotification(
+                    g,
+                    characteristic,
+                    false
+                )
+            }
+
+            controls.addView(
+                notify,
+                weightLp()
+            )
+        }
+
+        if (
+            characteristic.properties and
+            BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+        ) {
+
+            val indicate =
+                button("Indicate ON")
+
+            indicate.setOnClickListener {
+
+                enableNotification(
+                    g,
+                    characteristic,
+                    true
+                )
+            }
+
+            controls.addView(
+                indicate,
+                weightLp()
+            )
+        }
+
+        if (
+            characteristic.descriptors.isNotEmpty()
+        ) {
+
+            val descriptorButton =
+                button("Descriptors")
+
+            descriptorButton.setOnClickListener {
+
+                showDescriptorDialog(
+                    g,
+                    characteristic
+                )
+            }
+
+            controls.addView(
+                descriptorButton,
+                weightLp()
+            )
+        }
+
+        if (controls.childCount > 0) {
+
+            box.addView(
+                controls,
+                lp(-1, -2)
+            )
+        }
+
+        parent.addView(
+            box,
+            lp(-1, -2)
+        )
+    }
+
+    // ---------------------------------------------------------
+    // NOTIFICATION / INDICATION
+    // ---------------------------------------------------------
+
+    private fun enableNotification(
+        g: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        indication: Boolean
     ) {
 
         if (!hasConnectPermission()) {
 
             requestBluetoothPermissions()
 
-            status.text =
-                "Bluetooth Connect permission is required"
-
             return
         }
 
         try {
 
-            val enabled =
+            val local =
                 g.setCharacteristicNotification(
-                    c,
+                    characteristic,
                     true
                 )
 
-            if (!enabled) {
+            if (!local) {
 
                 status.text =
-                    "Notifications failed locally: ${c.uuid}"
+                    "Local notification registration failed"
 
                 return
             }
 
-            val descriptor =
-                c.getDescriptor(
-                    CCC_DESCRIPTOR_UUID
+            val cccd =
+                characteristic.descriptors.firstOrNull {
+                    it.uuid == CCCD_UUID
+                }
+
+            if (cccd == null) {
+
+                status.text =
+                    "CCCD descriptor not found"
+
+                addSection(
+                    "NOTIFICATION ERROR",
+                    """
+                    Characteristic: ${characteristic.uuid}
+                    CCCD descriptor was not exposed by the device.
+                    """.trimIndent()
                 )
 
-            if (descriptor != null) {
+                return
+            }
 
-                val value =
-                    if (
-                        c.properties and
-                        BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
-                    ) {
-                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    } else {
-                        BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                    }
+            val value =
+                if (indication) {
 
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+
+                } else {
+
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                }
+
+            val started =
                 if (Build.VERSION.SDK_INT >= 33) {
 
-                    val result =
-                        g.writeDescriptor(
-                            descriptor,
-                            value
-                        )
-
-                    status.text =
-                        "Notification setup requested: ${c.uuid} (result=$result)"
+                    g.writeDescriptor(
+                        cccd,
+                        value
+                    ) == BluetoothStatusCodes.SUCCESS
 
                 } else {
 
                     @Suppress("DEPRECATION")
-                    descriptor.value = value
+                    cccd.value = value
 
                     @Suppress("DEPRECATION")
-                    val started =
-                        g.writeDescriptor(descriptor)
-
-                    status.text =
-                        if (started) {
-                            "Notification setup requested: ${c.uuid}"
-                        } else {
-                            "Notification descriptor write failed: ${c.uuid}"
-                        }
+                    g.writeDescriptor(cccd)
                 }
 
-            } else {
-
-                status.text =
-                    "Notifications enabled locally: ${c.uuid}"
-            }
+            status.text =
+                if (started) {
+                    if (indication) {
+                        "Indication enabling requested"
+                    } else {
+                        "Notification enabling requested"
+                    }
+                } else {
+                    "CCCD write failed to start"
+                }
 
         } catch (e: SecurityException) {
 
@@ -1396,51 +1876,43 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
 
             status.text =
-                "Notify error: ${e.message ?: "Unknown error"}"
+                "Notification error: ${e.message}"
         }
     }
 
+    // ---------------------------------------------------------
+    // WRITE
+    // ---------------------------------------------------------
+
     private fun showWriteDialog(
         g: BluetoothGatt,
-        c: BluetoothGattCharacteristic
+        characteristic: BluetoothGattCharacteristic
     ) {
-
-        if (!hasConnectPermission()) {
-
-            requestBluetoothPermissions()
-
-            status.text =
-                "Bluetooth Connect permission is required"
-
-            return
-        }
 
         val input =
             EditText(this).apply {
 
                 hint =
-                    "HEX bytes, e.g. 01 FF 00"
+                    "HEX: 01 FF 00"
 
                 setSingleLine(true)
             }
 
         AlertDialog.Builder(this)
-
-            .setTitle(
-                "Write characteristic"
-            )
-
+            .setTitle("Write Characteristic")
             .setMessage(
-                c.uuid.toString()
+                "${characteristic.uuid}\n\n" +
+                    "Properties: ${
+                        properties(
+                            characteristic.properties
+                        )
+                    }"
             )
-
             .setView(input)
-
             .setNegativeButton(
                 "Cancel",
                 null
             )
-
             .setPositiveButton(
                 "Write"
             ) { _, _ ->
@@ -1462,7 +1934,7 @@ class MainActivity : Activity() {
 
                     val writeType =
                         if (
-                            c.properties and
+                            characteristic.properties and
                             BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
                         ) {
 
@@ -1477,328 +1949,455 @@ class MainActivity : Activity() {
 
                         val result =
                             g.writeCharacteristic(
-                                c,
+                                characteristic,
                                 bytes,
                                 writeType
                             )
 
                         status.text =
-                            "Write requested: ${c.uuid} (result=$result)"
+                            "Write requested • result=$result"
 
                     } else {
 
                         @Suppress("DEPRECATION")
-                        c.value = bytes
+                        characteristic.writeType =
+                            writeType
 
                         @Suppress("DEPRECATION")
-                        val started =
-                            g.writeCharacteristic(c)
+                        characteristic.value =
+                            bytes
+
+                        @Suppress("DEPRECATION")
+                        val ok =
+                            g.writeCharacteristic(
+                                characteristic
+                            )
 
                         status.text =
-                            if (started) {
-                                "Write requested: ${c.uuid}"
-                            } else {
-                                "Write could not be started: ${c.uuid}"
-                            }
+                            "Write requested • $ok"
                     }
-
-                } catch (e: SecurityException) {
-
-                    status.text =
-                        "Bluetooth permission denied"
 
                 } catch (e: Exception) {
 
                     status.text =
-                        "Write error: ${
-                            e.message ?: "Unknown error"
-                        }"
+                        "Write error: ${e.message}"
                 }
             }
-
             .show()
     }
 
-    /*
-     * ---------------------------------------------------------
-     * BLE SCAN CONTROL
-     * ---------------------------------------------------------
-     */
-
-    private fun startBleScan() {
-
-        if (!hasScanPermission()) {
-
-            requestBluetoothPermissions()
-
-            return
-        }
-
-        val a = adapter
-
-        if (a == null) {
-
-            status.text =
-                "Bluetooth adapter not available"
-
-            return
-        }
-
-        val enabled =
-            try {
-
-                a.isEnabled
-
-            } catch (_: SecurityException) {
-
-                false
-            }
-
-        if (!enabled) {
-
-            try {
-
-                startActivity(
-                    Intent(
-                        BluetoothAdapter.ACTION_REQUEST_ENABLE
-                    )
-                )
-
-            } catch (e: Exception) {
-
-                status.text =
-                    "Unable to request Bluetooth enable: ${
-                        e.message ?: "Unknown error"
-                    }"
-            }
-
-            return
-        }
-
-        if (scanning) {
-            return
-        }
-
-        seen.clear()
-
-        leScanner =
-            try {
-
-                a.bluetoothLeScanner
-
-            } catch (e: SecurityException) {
-
-                null
-            }
-
-        if (leScanner == null) {
-
-            status.text =
-                "BLE scanner unavailable"
-
-            return
-        }
-
-        scanning = true
-
-        status.text =
-            "BLE scan running…"
-
-        try {
-
-            val settings =
-                ScanSettings.Builder()
-                    .setScanMode(
-                        ScanSettings.SCAN_MODE_LOW_LATENCY
-                    )
-                    .build()
-
-            leScanner?.startScan(
-                null,
-                settings,
-                leCallback
-            )
-
-            handler.removeCallbacksAndMessages(null)
-
-            handler.postDelayed(
-                {
-                    stopBleScan()
-                },
-                15000L
-            )
-
-        } catch (e: SecurityException) {
-
-            scanning = false
-
-            status.text =
-                "Bluetooth scan permission denied"
-
-        } catch (e: Exception) {
-
-            scanning = false
-
-            status.text =
-                "BLE scan error: ${
-                    e.message ?: "Unknown error"
-                }"
-        }
-    }
-
-    private fun stopBleScan() {
-
-        handler.removeCallbacksAndMessages(null)
-
-        if (!scanning) {
-            return
-        }
-
-        try {
-
-            leScanner?.stopScan(
-                leCallback
-            )
-
-        } catch (_: SecurityException) {
-        } catch (_: Exception) {
-        }
-
-        scanning = false
-
-        status.text =
-            "BLE scan stopped • ${seen.size} devices"
-    }
-
-    /*
-     * ---------------------------------------------------------
-     * PERMISSIONS
-     * ---------------------------------------------------------
-     */
-
-    private fun requestBluetoothPermissions() {
-
-        if (Build.VERSION.SDK_INT >= 31) {
-
-            val permissions =
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_CONNECT
-                )
-
-            val missing =
-                permissions.filter {
-                    checkSelfPermission(it) !=
-                        PackageManager.PERMISSION_GRANTED
-                }
-
-            if (missing.isNotEmpty()) {
-
-                requestPermissions(
-                    missing.toTypedArray(),
-                    permissionRequest
-                )
-            }
-
-        } else if (Build.VERSION.SDK_INT >= 23) {
-
-            if (
-                checkSelfPermission(
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-
-                requestPermissions(
-                    arrayOf(
-                        Manifest.permission.ACCESS_FINE_LOCATION
-                    ),
-                    permissionRequest
-                )
-            }
-        }
-    }
-
-    private fun hasScanPermission(): Boolean {
-
-        return if (Build.VERSION.SDK_INT >= 31) {
-
-            checkSelfPermission(
-                Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
-
-        } else {
-
-            Build.VERSION.SDK_INT < 23 ||
-                checkSelfPermission(
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
-        }
-    }
-
-    private fun hasConnectPermission(): Boolean {
-
-        return if (Build.VERSION.SDK_INT >= 31) {
-
-            checkSelfPermission(
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
-
-        } else {
-
-            true
-        }
-    }
-
-    private fun hasBtPermission(): Boolean {
-
-        return hasScanPermission() &&
-            hasConnectPermission()
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
+    // ---------------------------------------------------------
+    // DESCRIPTORS
+    // ---------------------------------------------------------
+
+    private fun showDescriptorDialog(
+        g: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic
     ) {
 
-        super.onRequestPermissionsResult(
-            requestCode,
-            permissions,
-            grantResults
-        )
-
-        if (requestCode == permissionRequest) {
-
-            if (
-                grantResults.isNotEmpty() &&
-                grantResults.all {
-                    it == PackageManager.PERMISSION_GRANTED
+        val names =
+            characteristic.descriptors
+                .map {
+                    "${it.uuid}"
                 }
-            ) {
+                .toTypedArray()
+
+        if (names.isEmpty()) return
+
+        AlertDialog.Builder(this)
+            .setTitle(
+                "Descriptors"
+            )
+            .setItems(names) { _, which ->
+
+                readDescriptor(
+                    g,
+                    characteristic.descriptors[which]
+                )
+            }
+            .setNegativeButton(
+                "Close",
+                null
+            )
+            .show()
+    }
+
+    private fun readDescriptor(
+        g: BluetoothGatt,
+        descriptor: BluetoothGattDescriptor
+    ) {
+
+        try {
+
+            if (Build.VERSION.SDK_INT >= 33) {
+
+                val result =
+                    g.readDescriptor(
+                        descriptor
+                    )
 
                 status.text =
-                    "Bluetooth permissions granted"
+                    "Descriptor read requested • result=$result"
 
             } else {
 
+                @Suppress("DEPRECATION")
+                val result =
+                    g.readDescriptor(
+                        descriptor
+                    )
+
                 status.text =
-                    "Bluetooth permissions were not granted"
+                    "Descriptor read requested • $result"
             }
 
-            refreshLocalInfo()
+        } catch (e: Exception) {
+
+            status.text =
+                "Descriptor read error: ${e.message}"
         }
     }
 
-    /*
-     * ---------------------------------------------------------
-     * UI SECTIONS
-     * ---------------------------------------------------------
-     */
+    // ---------------------------------------------------------
+    // GATT DATA
+    // ---------------------------------------------------------
+
+    private fun renderGattData(
+        title: String,
+        uuid: UUID,
+        value: ByteArray,
+        statusCode: Int
+    ) {
+
+        addSection(
+            title,
+            """
+            UUID: $uuid
+            Status: $statusCode
+
+            HEX:
+            ${hex(value)}
+
+            TEXT:
+            ${printable(value)}
+            """.trimIndent()
+        )
+    }
+
+    private fun renderNotification(
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray
+    ) {
+
+        addSection(
+            "GATT NOTIFICATION",
+            """
+            Characteristic: ${characteristic.uuid}
+            Name: ${gattUuidName(characteristic.uuid)}
+
+            HEX:
+            ${hex(value)}
+
+            TEXT:
+            ${printable(value)}
+            """.trimIndent()
+        )
+    }
+
+    // ---------------------------------------------------------
+    // UUID NAMES
+    // ---------------------------------------------------------
+
+    private fun gattUuidName(
+        uuid: UUID
+    ): String {
+
+        return when (
+            uuid.toString().lowercase()
+        ) {
+
+            "00001800-0000-1000-8000-00805f9b34fb" ->
+                "Generic Access"
+
+            "00001801-0000-1000-8000-00805f9b34fb" ->
+                "Generic Attribute"
+
+            "0000180a-0000-1000-8000-00805f9b34fb" ->
+                "Device Information Service"
+
+            "0000180f-0000-1000-8000-00805f9b34fb" ->
+                "Battery Service"
+
+            "0000180d-0000-1000-8000-00805f9b34fb" ->
+                "Heart Rate Service"
+
+            "00001812-0000-1000-8000-00805f9b34fb" ->
+                "Human Interface Device"
+
+            "0000180e-0000-1000-8000-00805f9b34fb" ->
+                "Phone Alert Status"
+
+            "00001809-0000-1000-8000-00805f9b34fb" ->
+                "Health Thermometer"
+
+            "00002a00-0000-1000-8000-00805f9b34fb" ->
+                "Device Name"
+
+            "00002a01-0000-1000-8000-00805f9b34fb" ->
+                "Appearance"
+
+            "00002a19-0000-1000-8000-00805f9b34fb" ->
+                "Battery Level"
+
+            "00002a29-0000-1000-8000-00805f9b34fb" ->
+                "Manufacturer Name String"
+
+            "00002a24-0000-1000-8000-00805f9b34fb" ->
+                "Model Number String"
+
+            "00002a25-0000-1000-8000-00805f9b34fb" ->
+                "Serial Number String"
+
+            "00002a26-0000-1000-8000-00805f9b34fb" ->
+                "Firmware Revision String"
+
+            "00002a27-0000-1000-8000-00805f9b34fb" ->
+                "Hardware Revision String"
+
+            "00002a28-0000-1000-8000-00805f9b34fb" ->
+                "Software Revision String"
+
+            CCCD_UUID.toString().lowercase() ->
+                "Client Characteristic Configuration"
+
+            else ->
+                "Unknown / Custom UUID"
+        }
+    }
+
+    // ---------------------------------------------------------
+    // CHARACTERISTIC HELPERS
+    // ---------------------------------------------------------
+
+    private fun properties(
+        p: Int
+    ): String {
+
+        val list =
+            mutableListOf<String>()
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PROPERTY_BROADCAST != 0
+        ) {
+            list += "BROADCAST"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PROPERTY_READ != 0
+        ) {
+            list += "READ"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PROPERTY_WRITE != 0
+        ) {
+            list += "WRITE"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
+        ) {
+            list += "WRITE_NO_RESPONSE"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+        ) {
+            list += "NOTIFY"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+        ) {
+            list += "INDICATE"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PROPERTY_SIGNED_WRITE != 0
+        ) {
+            list += "SIGNED_WRITE"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PROPERTY_EXTENDED_PROPS != 0
+        ) {
+            list += "EXTENDED"
+        }
+
+        return list.joinToString(", ")
+            .ifEmpty {
+                "NONE"
+            }
+    }
+
+    private fun characteristicPermissions(
+        p: Int
+    ): String {
+
+        val list =
+            mutableListOf<String>()
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PERMISSION_READ != 0
+        ) {
+            list += "READ"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PERMISSION_WRITE != 0
+        ) {
+            list += "WRITE"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED != 0
+        ) {
+            list += "READ_ENCRYPTED"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED != 0
+        ) {
+            list += "WRITE_ENCRYPTED"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED_MITM != 0
+        ) {
+            list += "READ_MITM"
+        }
+
+        if (
+            p and
+            BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED_MITM != 0
+        ) {
+            list += "WRITE_MITM"
+        }
+
+        return list.joinToString(", ")
+            .ifEmpty {
+                "NONE"
+            }
+    }
+
+    private fun descriptorPermissions(
+        p: Int
+    ): String {
+
+        val list =
+            mutableListOf<String>()
+
+        if (
+            p and
+            BluetoothGattDescriptor.PERMISSION_READ != 0
+        ) {
+            list += "READ"
+        }
+
+        if (
+            p and
+            BluetoothGattDescriptor.PERMISSION_WRITE != 0
+        ) {
+            list += "WRITE"
+        }
+
+        if (
+            p and
+            BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED != 0
+        ) {
+            list += "READ_ENCRYPTED"
+        }
+
+        if (
+            p and
+            BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED != 0
+        ) {
+            list += "WRITE_ENCRYPTED"
+        }
+
+        if (
+            p and
+            BluetoothGattDescriptor.PERMISSION_READ_ENCRYPTED_MITM != 0
+        ) {
+            list += "READ_MITM"
+        }
+
+        if (
+            p and
+            BluetoothGattDescriptor.PERMISSION_WRITE_ENCRYPTED_MITM != 0
+        ) {
+            list += "WRITE_MITM"
+        }
+
+        return list.joinToString(", ")
+            .ifEmpty {
+                "NONE"
+            }
+    }
+
+    private fun writeTypeName(
+        type: Int
+    ): String {
+
+        return when (type) {
+
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT ->
+                "WRITE"
+
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE ->
+                "WRITE_NO_RESPONSE"
+
+            BluetoothGattCharacteristic.WRITE_TYPE_SIGNED ->
+                "SIGNED_WRITE"
+
+            else ->
+                type.toString()
+        }
+    }
+
+    // ---------------------------------------------------------
+    // GENERAL HELPERS
+    // ---------------------------------------------------------
 
     private fun addSection(
         title: String,
         body: String
     ) {
+
+        val card =
+            createSection(title)
+
+        if (body.isNotBlank()) {
+            addText(card, body)
+        }
+    }
+
+    private fun createSection(
+        title: String
+    ): LinearLayout {
 
         val card =
             findOrCreateSection(title)
@@ -1811,31 +2410,26 @@ class MainActivity : Activity() {
             ""
         )
 
-        if (body.isNotBlank()) {
-
-            addText(
-                card,
-                body
-            )
-        }
+        return card
     }
 
     private fun findOrCreateSection(
         title: String
     ): LinearLayout {
 
-        val existing =
-            (0 until results.childCount)
-                .map {
-                    results.getChildAt(it)
-                }
-                .filterIsInstance<LinearLayout>()
-                .firstOrNull {
-                    (it.tag as? String) == title
-                }
+        for (
+            i in 0 until results.childCount
+        ) {
 
-        if (existing != null) {
-            return existing
+            val child =
+                results.getChildAt(i)
+
+            if (
+                child is LinearLayout &&
+                child.tag == title
+            ) {
+                return child
+            }
         }
 
         return LinearLayout(this).apply {
@@ -1875,10 +2469,11 @@ class MainActivity : Activity() {
                     LinearLayout.HORIZONTAL
             }
 
-        val t =
+        val text =
             TextView(this).apply {
 
-                text = title
+                this.text =
+                    title
 
                 textSize = 16f
 
@@ -1891,7 +2486,7 @@ class MainActivity : Activity() {
             }
 
         row.addView(
-            t,
+            text,
             LinearLayout.LayoutParams(
                 0,
                 -2,
@@ -1899,21 +2494,29 @@ class MainActivity : Activity() {
             )
         )
 
-        val tr =
-            TextView(this).apply {
+        if (trailing.isNotEmpty()) {
 
-                text = trailing
+            val tail =
+                TextView(this).apply {
 
-                textSize = 12f
+                    this.text =
+                        trailing
 
-                setTextColor(
-                    getColor(R.color.muted)
-                )
-            }
+                    textSize = 12f
 
-        row.addView(tr)
+                    setTextColor(
+                        getColor(R.color.muted)
+                    )
+                }
 
-        parent.addView(row)
+            row.addView(
+                tail
+            )
+        }
+
+        parent.addView(
+            row
+        )
     }
 
     private fun addText(
@@ -1921,10 +2524,11 @@ class MainActivity : Activity() {
         text: String
     ) {
 
-        val v =
+        val view =
             TextView(this).apply {
 
-                this.text = text
+                this.text =
+                    text
 
                 textSize = 13f
 
@@ -1943,7 +2547,9 @@ class MainActivity : Activity() {
                     android.graphics.Typeface.MONOSPACE
             }
 
-        parent.addView(v)
+        parent.addView(
+            view
+        )
     }
 
     private fun button(
@@ -1952,13 +2558,15 @@ class MainActivity : Activity() {
 
         return Button(this).apply {
 
-            text = label
+            text =
+                label
 
             textSize = 11f
 
             isAllCaps = false
 
-            minHeight = dp(42)
+            minHeight =
+                dp(42)
 
             setPadding(
                 dp(4),
@@ -1970,13 +2578,12 @@ class MainActivity : Activity() {
     }
 
     private fun lp(
-        w: Int,
-        h: Int
-    ): LinearLayout.LayoutParams {
-
-        return LinearLayout.LayoutParams(
-            w,
-            h
+        width: Int,
+        height: Int
+    ) =
+        LinearLayout.LayoutParams(
+            width,
+            height
         ).apply {
 
             setMargins(
@@ -1986,12 +2593,9 @@ class MainActivity : Activity() {
                 dp(5)
             )
         }
-    }
 
-    private fun weightLp():
-        LinearLayout.LayoutParams {
-
-        return LinearLayout.LayoutParams(
+    private fun weightLp() =
+        LinearLayout.LayoutParams(
             0,
             dp(48),
             1f
@@ -2004,48 +2608,37 @@ class MainActivity : Activity() {
                 dp(5)
             )
         }
-    }
 
     private fun dp(
         value: Int
-    ): Int {
-
-        return (
+    ): Int =
+        (
             value *
                 resources.displayMetrics.density
             ).roundToInt()
-    }
 
-    /*
-     * ---------------------------------------------------------
-     * SAFE BLUETOOTH HELPERS
-     * ---------------------------------------------------------
-     */
+    // ---------------------------------------------------------
+    // BLUETOOTH HELPERS
+    // ---------------------------------------------------------
 
     private fun safeName(
-        d: BluetoothDevice
+        device: BluetoothDevice
     ): String {
 
         return try {
-
-            d.name ?: "(unknown)"
-
+            device.name ?: "(unknown)"
         } catch (_: SecurityException) {
-
             "(permission)"
         }
     }
 
     private fun safeAddress(
-        d: BluetoothDevice
+        device: BluetoothDevice
     ): String {
 
         return try {
-
-            d.address
-
+            device.address
         } catch (_: SecurityException) {
-
             "(permission)"
         }
     }
@@ -2055,11 +2648,8 @@ class MainActivity : Activity() {
     ): String {
 
         return try {
-
             a.name ?: "(unknown)"
-
         } catch (_: SecurityException) {
-
             "(permission)"
         }
     }
@@ -2069,11 +2659,8 @@ class MainActivity : Activity() {
     ): String {
 
         return try {
-
             a.address
-
         } catch (_: SecurityException) {
-
             "(restricted)"
         }
     }
@@ -2083,11 +2670,8 @@ class MainActivity : Activity() {
     ): String {
 
         return try {
-
             a.state.toString()
-
         } catch (_: SecurityException) {
-
             "unknown"
         }
     }
@@ -2132,164 +2716,9 @@ class MainActivity : Activity() {
         }
     }
 
-    /*
-     * ---------------------------------------------------------
-     * GATT PROPERTY / PERMISSION FORMATTERS
-     * ---------------------------------------------------------
-     */
-
-    private fun properties(
-        p: Int
-    ): String {
-
-        val out =
-            mutableListOf<String>()
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_BROADCAST != 0
-        ) {
-            out += "BROADCAST"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_READ != 0
-        ) {
-            out += "READ"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_WRITE != 0
-        ) {
-            out += "WRITE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
-        ) {
-            out += "WRITE_NO_RESPONSE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
-        ) {
-            out += "NOTIFY"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
-        ) {
-            out += "INDICATE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_SIGNED_WRITE != 0
-        ) {
-            out += "SIGNED_WRITE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PROPERTY_EXTENDED_PROPS != 0
-        ) {
-            out += "EXTENDED"
-        }
-
-        return out
-            .joinToString(", ")
-            .ifEmpty {
-                "none"
-            }
-    }
-
-    private fun permissions(
-        p: Int
-    ): String {
-
-        val out =
-            mutableListOf<String>()
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_READ != 0
-        ) {
-            out += "READ"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_WRITE != 0
-        ) {
-            out += "WRITE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED != 0
-        ) {
-            out += "READ_ENCRYPTED"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED != 0
-        ) {
-            out += "WRITE_ENCRYPTED"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED_MITM != 0
-        ) {
-            out += "READ_MITM"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_WRITE_ENCRYPTED_MITM != 0
-        ) {
-            out += "WRITE_MITM"
-        }
-
-        /*
-         * Correct Android constant:
-         * PERMISSION_WRITE_SIGNED
-         *
-         * NOT:
-         * PERMISSION_SIGNED_WRITE
-         */
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_WRITE_SIGNED != 0
-        ) {
-            out += "SIGNED_WRITE"
-        }
-
-        if (
-            p and
-            BluetoothGattCharacteristic.PERMISSION_WRITE_SIGNED_MITM != 0
-        ) {
-            out += "SIGNED_WRITE_MITM"
-        }
-
-        return out
-            .joinToString(", ")
-            .ifEmpty {
-                "none"
-            }
-    }
-
-    /*
-     * ---------------------------------------------------------
-     * DATA FORMATTERS
-     * ---------------------------------------------------------
-     */
+    // ---------------------------------------------------------
+    // DATA FORMATTERS
+    // ---------------------------------------------------------
 
     private fun formatManufacturer(
         sparse: android.util.SparseArray<ByteArray>?
@@ -2309,33 +2738,29 @@ class MainActivity : Activity() {
             ) {
 
                 append(
-                    "ID=${sparse.keyAt(i)}: ${
-                        hex(
-                            sparse.valueAt(i)
-                        )
-                    }\n"
+                    "Company ID=${sparse.keyAt(i)}: "
                 )
-            }
 
+                append(
+                    hex(
+                        sparse.valueAt(i)
+                    )
+                )
+
+                append("\n")
+            }
         }.trim()
     }
 
-    /*
-     * ScanRecord.serviceData uses ParcelUuid keys.
-     *
-     * Map<*, ByteArray> deliberately avoids forcing UUID here.
-     */
     private fun formatMap(
-        map: Map<*, ByteArray>?
+        map: Map<UUID, ByteArray>?
     ): String {
 
         if (map.isNullOrEmpty()) {
             return "none"
         }
 
-        return map.entries.joinToString(
-            "\n"
-        ) {
+        return map.entries.joinToString("\n") {
 
             "${it.key}: ${hex(it.value)}"
         }
@@ -2377,24 +2802,29 @@ class MainActivity : Activity() {
     }
 
     private fun parseHex(
-        s: String
+        input: String
     ): ByteArray {
 
-        if (s.isBlank()) {
+        val cleaned =
+            input
+                .trim()
+                .replace(
+                    Regex("[,:-]"),
+                    " "
+                )
+
+        if (cleaned.isBlank()) {
             return ByteArray(0)
         }
 
-        return s
-            .trim()
+        return cleaned
             .split(
-                Regex("[\\s,:-]+")
+                Regex("\\s+")
             )
             .filter {
-
-                it.isNotBlank() &&
-                    it.matches(
-                        Regex("[0-9A-Fa-f]{1,2}")
-                    )
+                it.matches(
+                    Regex("[0-9A-Fa-f]{1,2}")
+                )
             }
             .map {
                 it.toInt(16).toByte()
@@ -2402,18 +2832,94 @@ class MainActivity : Activity() {
             .toByteArray()
     }
 
-    /*
-     * ---------------------------------------------------------
-     * PARCELABLE COMPATIBILITY
-     * ---------------------------------------------------------
-     */
+    // ---------------------------------------------------------
+    // PERMISSIONS
+    // ---------------------------------------------------------
+
+    private fun hasScanPermission(): Boolean {
+
+        return if (Build.VERSION.SDK_INT >= 31) {
+
+            checkSelfPermission(
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+
+        } else {
+
+            true
+        }
+    }
+
+    private fun hasConnectPermission(): Boolean {
+
+        return if (Build.VERSION.SDK_INT >= 31) {
+
+            checkSelfPermission(
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+
+        } else {
+
+            true
+        }
+    }
+
+    private fun requestBluetoothPermissions() {
+
+        if (Build.VERSION.SDK_INT >= 31) {
+
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.BLUETOOTH_CONNECT
+                ),
+                permissionRequest
+            )
+
+        } else if (Build.VERSION.SDK_INT >= 23) {
+
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION
+                ),
+                permissionRequest
+            )
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+
+        super.onRequestPermissionsResult(
+            requestCode,
+            permissions,
+            grantResults
+        )
+
+        if (
+            requestCode ==
+            permissionRequest
+        ) {
+
+            refreshLocalInfo()
+        }
+    }
+
+    // ---------------------------------------------------------
+    // PARCELABLE COMPATIBILITY
+    // ---------------------------------------------------------
 
     private inline fun <reified T : Parcelable>
-        Intent.getParcelableExtraCompat(
-            key: String
-        ): T? {
+            Intent.getParcelableExtraCompat(
+        key: String
+    ): T? {
 
-        return if (Build.VERSION.SDK_INT >= 33) {
+        return if (
+            Build.VERSION.SDK_INT >= 33
+        ) {
 
             getParcelableExtra(
                 key,
@@ -2423,18 +2929,9 @@ class MainActivity : Activity() {
         } else {
 
             @Suppress("DEPRECATION")
-            getParcelableExtra(key)
-        }
-    }
-
-    companion object {
-
-        /*
-         * Standard Client Characteristic Configuration Descriptor.
-         */
-        private val CCC_DESCRIPTOR_UUID =
-            java.util.UUID.fromString(
-                "00002902-0000-1000-8000-00805F9B34FB"
+            getParcelableExtra(
+                key
             )
+        }
     }
 }
