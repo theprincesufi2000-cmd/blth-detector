@@ -263,10 +263,16 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             return
         }
 
-        if (connecting || gatt != null) {
-            updateHidPresence()
+        // HID input has priority. If Android already exposes glaze-4 as an
+        // input device, do NOT try to open GATT for it.
+        if (isHidInputPresent()) {
+            if (gatt == null && !connecting) {
+                setHidReadyUi()
+            }
             return
         }
+
+        if (connecting || gatt != null) return
 
         val activeGatt = try {
             bluetoothManager.getConnectedDevices(BluetoothProfile.GATT)
@@ -274,18 +280,13 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             emptyList()
         }
 
+        // First choice: a GATT connection that Android already reports.
         val glazeGatt = activeGatt.firstOrNull { matchesGlaze4(it) }
-
         if (glazeGatt != null) {
             connectGattToGlaze4(glazeGatt)
             return
         }
 
-        /*
-         * If glaze-4 is already paired but not currently GATT-connected,
-         * use the paired device as the GATT target only if Android reports
-         * LE/dual transport. We do not pretend that pairing means connection.
-         */
         val bonded = try {
             bluetoothManager.adapter.bondedDevices.toList()
         } catch (_: Exception) {
@@ -293,45 +294,51 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         }
 
         val glaze = bonded.firstOrNull { matchesGlaze4(it) }
-
-        if (glaze != null) {
-            setDeviceName(glaze)
-
-            if (isLikelyHid(glaze)) {
-                updateHidPresence()
-
-                if (isHidInputPresent()) {
-                    captureEnabled = true
-                    status.text = "متصل عبر HID — جاهز للالتقاط"
-                    mode.text = "HID • إدخال النظام"
-                    commandLog.text =
-                        "glaze-4 ظاهر كجهاز إدخال HID.\n\n" +
-                        "اضغط أي زر في glaze-4 الآن."
-                } else {
-                    status.text = "glaze-4 مقترن — HID غير ظاهر للتطبيق"
-                    mode.text = "HID • بانتظار إدخال النظام"
-                    commandLog.text =
-                        "الجهاز مقترن، لكن Android لم يعرضه كجهاز إدخال HID " +
-                        "حاليًا.\n\nشغّل/اتصل بـ glaze-4 من إعدادات Bluetooth ثم عد إلى هنا."
-                }
-            } else {
-                status.text = "glaze-4 مقترن — جارٍ فتح GATT…"
-                mode.text = "GATT • اتصال تلقائي"
-                commandLog.text =
-                    "تم اختيار glaze-4 فقط.\nجارٍ فتح اتصال GATT…"
-                connectGattToGlaze4(glaze)
-            }
-            return
-        }
-
-        val hidPresent = isHidInputPresent()
-        if (!hidPresent) {
+        if (glaze == null) {
             status.text = "في انتظار اتصال glaze-4…"
-            mode.text = "GATT / HID • تلقائي"
-            deviceName.text = "glaze-4"
+            mode.text = "HID / GATT • تلقائي"
+            deviceName.text = targetName
             commandLog.text =
                 "اتصل بـ glaze-4 من إعدادات Bluetooth.\n\n" +
                 "لن يبحث التطبيق عن أجهزة أخرى."
+            return
+        }
+
+        setDeviceName(glaze)
+
+        when (glaze.type) {
+            BluetoothDevice.DEVICE_TYPE_CLASSIC -> {
+                // Classic Bluetooth cannot be opened with connectGatt().
+                // Wait for Android's HID input stack instead.
+                status.text = "glaze-4 متصل — بانتظار HID"
+                mode.text = "Bluetooth Classic / HID"
+                commandLog.text =
+                    "تم العثور على glaze-4 كـ Bluetooth Classic.\n\n" +
+                    "لن نحاول فتح GATT لهذا الجهاز.\n" +
+                    "اضغط «بدء التقاط الأوامر» ثم اضغط زرًا في الجهاز."
+            }
+
+            BluetoothDevice.DEVICE_TYPE_LE,
+            BluetoothDevice.DEVICE_TYPE_DUAL -> {
+                status.text = "glaze-4 — جارٍ فتح GATT…"
+                mode.text =
+                    if (glaze.type == BluetoothDevice.DEVICE_TYPE_DUAL)
+                        "Dual • GATT تلقائي"
+                    else
+                        "BLE • GATT تلقائي"
+                commandLog.text =
+                    "تم اختيار glaze-4 فقط.\n" +
+                    "جارٍ فتح قناة GATT…"
+                connectGattToGlaze4(glaze)
+            }
+
+            else -> {
+                status.text = "نوع glaze-4 غير معروف"
+                mode.text = "Bluetooth • غير محدد"
+                commandLog.text =
+                    "Android لم يحدد نوع النقل لهذا الجهاز.\n\n" +
+                    "لن يتم فتح GATT عشوائيًا."
+            }
         }
     }
 
@@ -372,6 +379,20 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         if (!hasConnectPermission()) return
         if (connecting || gatt != null) return
 
+        // Never force GATT on a Classic-only device.
+        if (device.type == BluetoothDevice.DEVICE_TYPE_CLASSIC) {
+            connecting = false
+            runOnUiThread {
+                setDeviceName(device)
+                status.text = "glaze-4 متصل — بانتظار HID"
+                mode.text = "Bluetooth Classic / HID"
+                commandLog.text =
+                    "هذا الجهاز Classic Bluetooth وليس GATT.\n\n" +
+                    "اضغط «بدء التقاط الأوامر» ثم اضغط زرًا في glaze-4."
+            }
+            return
+        }
+
         connecting = true
         setDeviceName(device)
 
@@ -383,22 +404,39 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         }
 
         try {
-            gatt =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    device.connectGatt(
-                        this,
-                        false,
-                        gattCallback,
-                        BluetoothDevice.TRANSPORT_LE
-                    )
-                } else {
-                    @Suppress("DEPRECATION")
-                    device.connectGatt(
-                        this,
-                        false,
-                        gattCallback
-                    )
+            // For Dual devices, explicitly request LE. For LE devices this is
+            // also the correct transport. Classic devices were rejected above.
+            gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                device.connectGatt(
+                    this,
+                    false,
+                    gattCallback,
+                    BluetoothDevice.TRANSPORT_LE
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                device.connectGatt(this, false, gattCallback)
+            }
+
+            // Do not leave the UI stuck forever if the stack never calls back.
+            handler.postDelayed({
+                if (connecting && gatt != null) {
+                    try {
+                        gatt?.disconnect()
+                        gatt?.close()
+                    } catch (_: Exception) {
+                    }
+                    gatt = null
+                    connecting = false
+                    runOnUiThread {
+                        status.text = "تعذر فتح GATT لـ glaze-4"
+                        mode.text = "HID / GATT • تلقائي"
+                        commandLog.text =
+                            "لم يستجب glaze-4 لاتصال GATT.\n\n" +
+                            "إذا كان الجهاز يعمل كـ HID، سيظهر عند توفره في Android."
+                    }
                 }
+            }, 12000L)
         } catch (_: Exception) {
             connecting = false
             gatt = null
@@ -407,8 +445,8 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
                 status.text = "تعذر فتح GATT لـ glaze-4"
                 mode.text = "HID / GATT • تلقائي"
                 commandLog.text =
-                    "لم يفتح glaze-4 كـGATT.\n\n" +
-                    "إذا كان الجهاز HID تقليديًا، سيُستخدم مسار إدخال النظام."
+                    "لم يفتح glaze-4 كـ GATT.\n\n" +
+                    "لن يتم الاتصال بأي جهاز آخر."
             }
         }
     }
@@ -612,7 +650,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
                 if (captureEnabled)
                     "HID متصل — الالتقاط فعال"
                 else
-                    "HID متصل — اضغط زر بدء الالتقاط"
+                    "HID متصل — جاهز لبدء الالتقاط"
 
             if (!captureEnabled) {
                 commandLog.text =
