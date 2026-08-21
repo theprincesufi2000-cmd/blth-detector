@@ -10,6 +10,10 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.content.BroadcastReceiver
+import android.content.ComponentName
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.hardware.input.InputManager
@@ -17,6 +21,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.InputDevice
 import android.view.KeyEvent
@@ -52,6 +58,48 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     private lateinit var deviceName: TextView
     private lateinit var mode: TextView
     private lateinit var commandLog: TextView
+
+    private val prefs by lazy {
+        getSharedPreferences("capture", Context.MODE_PRIVATE)
+    }
+
+    private val systemHidReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != Glaze4KeyCaptureService.ACTION_KEY_EVENT) return
+            if (!captureEnabled) return
+
+            val deviceNameValue = intent.getStringExtra(Glaze4KeyCaptureService.EXTRA_DEVICE_NAME)
+                ?: "deviceId=${intent.getIntExtra(Glaze4KeyCaptureService.EXTRA_DEVICE_ID, -1)}"
+            val deviceId = intent.getIntExtra(Glaze4KeyCaptureService.EXTRA_DEVICE_ID, -1)
+            val keyCode = intent.getIntExtra(Glaze4KeyCaptureService.EXTRA_KEY_CODE, -1)
+            val action = intent.getStringExtra(Glaze4KeyCaptureService.EXTRA_ACTION) ?: "UNKNOWN"
+            val source = intent.getIntExtra(Glaze4KeyCaptureService.EXTRA_SOURCE, 0)
+            val scanCode = intent.getIntExtra(Glaze4KeyCaptureService.EXTRA_SCAN_CODE, 0)
+            val flags = intent.getIntExtra(Glaze4KeyCaptureService.EXTRA_FLAGS, 0)
+            val repeat = intent.getIntExtra(Glaze4KeyCaptureService.EXTRA_REPEAT, 0)
+
+            eventNumber++
+            showCaptured(
+                title = "SYSTEM HID #$eventNumber",
+                body =
+                    "DEVICE: $deviceNameValue\n" +
+                    "DEVICE ID: $deviceId\n" +
+                    "KEY CODE: $keyCode (${KeyEvent.keyCodeToString(keyCode)})\n" +
+                    "ACTION: $action\n" +
+                    "SOURCE: 0x%08X\n".format(source) +
+                    "SCAN CODE: $scanCode\n" +
+                    "FLAGS: 0x%08X\n".format(flags) +
+                    "REPEAT: $repeat"
+            )
+        }
+    }
+
+    private val serviceStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != Glaze4KeyCaptureService.ACTION_SERVICE_STATE) return
+            updateAdvancedCaptureUi()
+        }
+    }
 
     private val targetName = "glaze-4"
 
@@ -216,13 +264,27 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
         buildCleanUi()
         requestConnectPermission()
 
+        val keyFilter = IntentFilter(Glaze4KeyCaptureService.ACTION_KEY_EVENT)
+        val stateFilter = IntentFilter(Glaze4KeyCaptureService.ACTION_SERVICE_STATE)
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(systemHidReceiver, keyFilter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(serviceStateReceiver, stateFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(systemHidReceiver, keyFilter)
+            @Suppress("DEPRECATION")
+            registerReceiver(serviceStateReceiver, stateFilter)
+        }
+
         inputManager.registerInputDeviceListener(this, handler)
         handler.post(autoDetectRunnable)
+        updateAdvancedCaptureUi()
     }
 
     override fun onResume() {
         super.onResume()
         autoDetectGlaze4()
+        updateAdvancedCaptureUi()
     }
 
     override fun onDestroy() {
@@ -230,6 +292,15 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
         try {
             inputManager.unregisterInputDeviceListener(this)
+        } catch (_: Exception) {
+        }
+
+        try {
+            unregisterReceiver(systemHidReceiver)
+        } catch (_: Exception) {
+        }
+        try {
+            unregisterReceiver(serviceStateReceiver)
         } catch (_: Exception) {
         }
 
@@ -714,13 +785,31 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
     }
 
     private fun startCapture() {
+        if (!isAccessibilityCaptureEnabled()) {
+            captureEnabled = false
+            prefs.edit().putBoolean(Glaze4KeyCaptureService.PREF_CAPTURE_ENABLED, false).apply()
+            status.text = "الالتقاط المتقدم غير مفعّل"
+            mode.text = "HID • يحتاج خدمة النظام"
+            commandLog.text =
+                "هذه هي الخطوة المطلوبة مرة واحدة فقط.\n\n" +
+                "اضغط «تفعيل الالتقاط المتقدم للنظام»، ثم فعّل خدمة «Glaze4 HID Capture» من إعدادات إمكانية الوصول.\n\n" +
+                "بعد العودة إلى التطبيق اضغط «بدء التقاط الأوامر» ثم اضغط زر الصوت في glaze-4."
+            return
+        }
+
         captureEnabled = true
-        window.decorView.isFocusableInTouchMode = true
-        window.decorView.requestFocus()
+        prefs.edit().putBoolean(Glaze4KeyCaptureService.PREF_CAPTURE_ENABLED, true).apply()
         eventNumber = 0
         lastPacket = null
 
-        if (receiving) {
+        if (isAccessibilityCaptureEnabled()) {
+            status.text = "التقاط HID المتقدم فعال"
+            commandLog.text =
+                "الالتقاط على مستوى النظام فعال.\n\n" +
+                "اضغط زرًا واحدًا في glaze-4 الآن.\n" +
+                "سيظهر KeyEvent هنا حتى لو استهلكه Android للتحكم بالصوت.\n\n" +
+                "لن يمنع التطبيق الزر من تنفيذ وظيفته الأصلية."
+        } else if (receiving) {
             status.text = "التقاط GATT فعال"
             commandLog.text =
                 "اضغط زرًا واحدًا فقط في glaze-4.\n\n" +
@@ -744,6 +833,7 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
     private fun stopCapture() {
         captureEnabled = false
+        prefs.edit().putBoolean(Glaze4KeyCaptureService.PREF_CAPTURE_ENABLED, false).apply()
         status.text = "الالتقاط متوقف"
         commandLog.text =
             "لم يعد التطبيق يسجل ضغطات الأزرار.\n\n" +
@@ -849,6 +939,13 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
 
         root.addView(
             clear,
+            marginParams(-1, -2, 0, 0, 0, 8)
+        )
+
+        val advanced = makeButton("⚙  تفعيل الالتقاط المتقدم للنظام")
+        advanced.setOnClickListener { openAccessibilitySettings() }
+        root.addView(
+            advanced,
             marginParams(-1, -2, 0, 0, 0, 14)
         )
 
@@ -883,6 +980,48 @@ class MainActivity : Activity(), InputManager.InputDeviceListener {
             setPadding(dp(12), dp(14), dp(12), dp(14))
             setBackgroundColor(0xFF5B5B60.toInt())
             isClickable = true
+        }
+    }
+
+    private fun isAccessibilityCaptureEnabled(): Boolean {
+        val expected = ComponentName(this, Glaze4KeyCaptureService::class.java)
+        val enabled = try {
+            Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+        } catch (_: Exception) {
+            null
+        } ?: return false
+
+        val expectedFlat = expected.flattenToString()
+        return TextUtils.SimpleStringSplitter(':').run {
+            setString(enabled)
+            any { it.equals(expectedFlat, ignoreCase = true) }
+        }
+    }
+
+    private fun openAccessibilitySettings() {
+        try {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } catch (_: Exception) {
+            startActivity(Intent(Settings.ACTION_SETTINGS))
+        }
+    }
+
+    private fun updateAdvancedCaptureUi() {
+        runOnUiThread {
+            if (isAccessibilityCaptureEnabled()) {
+                mode.text = if (captureEnabled)
+                    "HID • خدمة النظام متصلة • التقاط فعال"
+                else
+                    "HID • خدمة النظام متصلة"
+                if (!captureEnabled && isHidInputPresent()) {
+                    status.text = "HID متصل — الالتقاط المتقدم جاهز"
+                }
+            } else {
+                if (!captureEnabled) {
+                    mode.text = "HID / GATT • يحتاج خدمة النظام"
+                    status.text = "فعّل الالتقاط المتقدم من الإعدادات"
+                }
+            }
         }
     }
 
